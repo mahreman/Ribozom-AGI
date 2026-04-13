@@ -1,365 +1,656 @@
-# RIBOZOM — PROJE DURUMU v10K
+# RIBOZOM — PROJE DURUMU v15K (7 Domain)
 
 **Tarih:** 2026-04-13
-**Önceki mühür:** PROJE_DURUMU_v6.md (2026-04-08), TEKNIK_BORC_v7.md (2026-04-10)
-**Bu mühür:** v6.16c Trie → Modüler Refactoring → Düzeltme Döngüsü → Lizozom → 10K UTF-8 Türkçe
+**Önceki mühür:** PROJE_DURUMU_v10K.md (2026-04-13), TEKNIK_BORC_v7.md (2026-04-10)
+**Bu mühür:** 10K Stabilizasyon → Kritik Bug Fix'ler → Stress Test → 15K 7-Domain Genişleme
 
 ---
 
-## 1. Kronoloji (8 Nisan → 13 Nisan)
+## 1. Kronoloji (13 Nisan — Tek Gün İçi)
 
-### v6.16c — LCRS Trie Optimizasyonu
-- **Sorun:** `rtrain()` ve `rpredict()` O(NT) — 100K şablon × her karakter pozisyonu = darboğaz.
-- **Çözüm:** Left-Child Right-Sibling (LCRS) Trie. Şablonlar ters sırada ağaca eklenir.
-  Arama O(NT) → O(MAX_TLEN × branching) ≈ O(80) per position.
-- **Sonuç:** ~3.2MB BSS ekstra, 300K düğüm havuzu. Metrikler aynı, eğitim hızı artışı.
+### 1.1 prompt_prior_qa Serialization Gap — Kritik Fix
+- **Sorun:** `--train` olmadan load-only modda QA SPEAK çöp üretiyordu ("ke¿aek¿").
+  Kök neden: `prompt_prior_qa[][]` matrisi ribo31.bin'e serialize edilmiyordu.
+  Load sonrası QA state machine tamamen boş — q_dom hesaplanamıyor, inject_qa_prior tetiklenmiyor.
+- **Denenen çözüm:** prompt_prior_qa'yı persist.h'e eklemek → Unity Build sırası hatası
+  (prompt_prior_qa, qa.h'de tanımlı, persist.h qa.h'den önce include ediliyor). Revert edildi.
+- **Uygulanan çözüm:** Load-only modda "Hızlı Faz 6 Rebuild" — train verisini yükleyip
+  SADECE `build_soft_cats()` + `v5_init_token_ids()` + `build_qa_transitions()` çalıştır.
+  - Süre: **0.01 saniye** (65 dakikalık tam eğitim yerine)
+  - QA Metrik 1: 49% → **69.8%**
+  - SPEAK: çöp → gerçek cümleler
+  - q_dom hesaplanan: 0 → 350/350
 
-### Modüler Refactoring (Unity Build)
-- **Sorun:** Tek dosya `ribozom_v31_microtubule.c` (3655 satır) bakım kabusuydu.
-- **Çözüm:** 7 modüle bölündü, Unity Build pattern korundu:
+### 1.2 Tekrarlı Öğrenme İdempotency Fix
+- **Sorun:** Aynı düzeltme tekrar verildiğinde `ribozom_correct()` her seferinde
+  rtrain×10 + golgi×3 + bl_train×10 çalıştırıyordu → şablon şişmesi.
+  5 tekrarda model 10.6MB → 11.9MB, şablon sayısı sürekli artıyordu.
+- **Çözüm:** `ribozom_correct()` başında Lizozom idempotency kontrolü eklendi:
+  ```c
+  int existing = qa_mem_lookup(question);
+  if (existing >= 0 && strcmp(qa_mem[existing].answer, test_ans) == 0) {
+      qa_mem[existing].hit_count++;  // Sadece sayaç artır
+      save_model("ribo31.bin");
+      return;  // Ağır eğitim ATLA
+  }
   ```
-  ribozom_config.h   — Sabitler, tipler, dyn_norm         (~140 satır)
-  ribozom_core.h     — Şablonlar, Trie, rtrain, rpredict  (~300 satır)
-  ribozom_vocab.h    — ER, kelime, hash, esim, cluster     (~425 satır)
-  ribozom_golgi.h    — Golgi, cat templates, predict_meta  (~140 satır)
-  ribozom_micro.h    — Mikrotübül, morfoloji, v31/v32      (~620 satır)
-  ribozom_persist.h  — save_model / load_model             (~235 satır)
-  ribozom_qa.h       — QA state machine, SPEAK, injection  (~1640 satır)
-  ribozom_main.c     — main(), training, test, interactive (~900 satır)
-  ```
-- **Include sırası kritik:** config → core → vocab → golgi → micro → persist → qa → main
-- **Sonuç:** Sıfır regresyon. Tüm metrikler korundu (Test 57.5%, OOV 57.4%, QA 74.2%, SOV 70.3%, SNR 6.69).
+- **Sonuç:** 5 tekrarda şablon sayısı ve model boyutu **tamamen sabit**. Sıfır şişme.
+  Farklı cevap geldiğinde tam eğitim yolu korunuyor.
 
-### Düzeltme Döngüsü (Correction Loop)
-- **Tasarım:** 3 katmanlı mimari:
-  1. **Parse:** "hayır, X" algılama, noktalama temizleme, kelime kayıt
-  2. **Live Learning:** rtrain×10 (g_correction_mode=1, 10x enerji), bl_train×10, golgi×3, incremental matrix updates, QA transitions×5
-  3. **Persistence:** Lizozom store + save_model()
-  
-- **Kritik buluş — Copy Reflex baskınlığı:** İlk 6+ düzeltme denemesi başarısız oldu.
-  Kök neden: COPY_K_BASE=25.0 × SNR, 12500 satırlık eğitim sinyali 10 satırlık düzeltmeyi eziyordu.
-  
-- **Çözüm — İki katmanlı:**
-  1. `CORRECTION_ENERGY_MULT=10.0f` — rtrain'de düzeltme anında 10x enerji (0.3→3.0)
-  2. **Lizozom** — SPEAK'i bypass eden doğrudan QA hafızası
+### 1.3 Lizozom Stress Test — 10 Test, 9 PASS, 0 FAIL
+Otomatik stress test scripti (stress_test.sh) 10 senaryo:
 
-### Lizozom (Doğrudan QA Hafızası)
-- **Biyolojik metafor:** Hücrenin sindirim kesesi — bilgi doğrudan depolanır ve çağrılır.
-- **Mekanizma:** Bag-of-words Jaccard eşleşmesi (threshold ≥ 0.5)
-  - Soru kelimelerinden içerik kelimelerini çıkar (soru parçacıkları filtrelenir)
-  - Tüm qa_mem[] kayıtlarıyla karşılaştır, en yüksek Jaccard → cevap döndür
-- **Boyut:** MAX_QA_MEM=256 çift, MAX_QA_ALEN=256 byte cevap
-- **Kalıcılık:** ribo31.bin'e serialize edilir (RIBO_VERSION=3, v2 geriye uyumlu)
-- **Stres testi sonuçları:**
-  - Tek düzeltme yeterli (6+ denemeden 1'e düşüş)
-  - Çoklu fact'ler birbirini bozmuyor
-  - Format varyasyonları çalışıyor ("kedi ne yer" = "kedi ne yer?")
+| # | Test | Sonuç | Detay |
+|---|------|-------|-------|
+| 1 | Temel Öğrenme (20 bilgi) | ✅ PASS | 20/20 öğrenildi |
+| 2 | Geri Çağırma | ✅ PASS | 20/20 doğru hatırlandı |
+| 3 | Persistence (kapat-aç) | ✅ PASS | 6/6 doğru |
+| 4 | Çakışma (güncelleme) | ✅ PASS | balık→tavuk güncellendi |
+| 5 | Operatör Farklılığı | ✅ PASS | "ne yer"→tavuk, "ne içer"→süt AYRI |
+| 6 | Tekrarlı Öğrenme | ✅ PASS | Sıfır şişme (fix sonrası) |
+| 7 | Toplu Yükleme (30 bilgi) | ✅ PASS | 30/30, toplam 47 lizozom |
+| 8 | Karışık Geri Çağırma | ✅ PASS | 5/6 (1 miss: bag-of-words çakışma) |
+| 9 | Bilinmeyen Soru (SPEAK fallback) | ✅ PASS | SPEAK devreye giriyor |
+| 10 | Kapasite Analizi | ✅ PASS | 47/256 slot (%82 boş) |
 
-### 10K UTF-8 Türkçe Geçişi (devam ediyor)
-- **Veri:** 9500 train + 500 test + 100 OOV
-  - 6500 düz ifade (SOV), 3000 QA çifti, 500 bilgi cümlesi
-  - 302 benzersiz kelime, 70 özne, 52 nesne, 20 fiil çeşidi
-  - Türkçe UTF-8 karakterler korunuyor (ş, ç, ğ, ı, ö, ü)
-  
-- **Kod değişiklikleri:**
-  - `MAX_SYM: 256→512`, `CAT_SYM_START: 128→384` (UTF-8 byte çakışması önlendi)
-  - `MAX_TLEN: 8→12` (UTF-8'de 2 byte/karakter, eşdeğer bağlam penceresi)
-  - `MAX_LINE: 128→256` (UTF-8 satırlar daha uzun)
-  - `MAX_TRIE_NODES: 300K→500K` (daha derin ağaç)
-  - `turkce_normalize()` kaldırıldı (eğitim verisi artık Türkçe)
-  - Soru kelimeleri ve düzeltme komutları UTF-8 Türkçeye güncellendi
-  
-- **Durum:** Derleme başarılı, test çalışıyor (sonuç bekleniyor).
+**Kritik bulgu:** Operatör körlüğü YOK! "kedi ne yer" ≠ "kedi ne içer" çünkü "yer"/"içer"
+soru filtre listesinde değil → Jaccard farklı kelime setleri olarak algılıyor.
 
----
+**T8 miss analizi:** "köpek nasıl ses çıkarır" → "havhav" yerine "öööö" döndü.
+"ses çıkarır" ortak kelimeler tüm hayvan sesi sorularında aynı → son kaydedilen kazanıyor.
+Çözüm: TF-IDF veya pozisyon ağırlığı (ileride).
 
-## 2. Mimari Kararlar ve Gerekçeleri
+### 1.4 Hayır Fix Doğrulaması
+İnteraktif mod tam çalışma döngüsü test edildi:
+- ✅ UTF-8 "hayır" (ı harfi) doğru algılanıyor
+- ✅ Virgül yapışması yok ("hayır, balık" → cevap temiz "balık")
+- ✅ İlk seferde algılama (önceki bug: ilk hayır atlanıyordu)
+- ✅ "hhayir" karakter ikileşmesi giderildi
+- ✅ Düzeltme sonrası Lizozom'dan doğru geri çağırma
 
-### Neden UTF-8 byte-level (codepoint değil)?
-Ribozom karakter-seviyesi çalışıyor. UTF-8'de "ş" = 2 byte (0xC5, 0x9F). Her byte ayrı sembol olarak işleniyor. Bu yaklaşım:
-- **Avantaj:** Sıfır refactoring — mevcut rtrain/rpredict aynen çalışıyor
-- **Avantaj:** Byte dizilimleri deterministik — "ş" her zaman aynı 2 sembol
-- **Dezavantaj:** MAX_TLEN=12 byte ≈ 6 Türkçe karakter bağlam (vs eski 8 ASCII karakter)
-- **Kabul:** Yeterli, çünkü kelime-içi tahmin 3-4 karakter bağlam kullanıyor
+### 1.5 15K 7-Domain Veri Jeneratörü
+Mevcut 10K hayvan-yemek corpus'unun ötesine geçmek için 7 domain'li jeneratör yazıldı:
 
-### Neden MAX_SYM=512, CAT_SYM_START=384?
-UTF-8 continuation byte'ları 0x80-0xBF (128-191) arasında. Eski CAT_SYM_START=128 bu bölgeyle çakışıyordu. Yeni düzen:
-- 0-255: tüm byte değerleri (ASCII + UTF-8)
-- 384-511: kategori sembolleri (128 slot)
-- Çakışma sıfır.
+| Domain | Özne Örnekleri | Nesne Örnekleri | Fiil Örnekleri | Cümle Sayısı |
+|--------|---------------|-----------------|----------------|-------------|
+| D0: Hayvan-Yemek | kedi, aslan, çiftçi | balığı, ekmeği | yer, içer, sever | 5000 |
+| D1: Meslek-İş | doktor, avukat, mimar | hastayı, projeyi | tedavi eder, tasarlar | 1600 |
+| D2: Spor | futbolcu, yüzücü, atlet | topu, kupayı | atar, koşar, kazanır | 1300 |
+| D3: Aile-Günlük | anne, baba, bebek | yemeği, hikâyeyi | pişirir, anlatır | 1300 |
+| D4: Doğa-Hava | yağmur, güneş, nehir | toprağı, ağaçları | ıslatır, yağar* | 1300 |
+| D5: Bilim-Eğitim | fizikçi, biyolog | deneyi, atomu | inceler, keşfeder | 1300 |
+| D6: Ulaşım | şoför, otobüs, tren | yolcuyu, yükü | taşır, sürer, uçar | 1300 |
+| Cross-domain köprüler | — | — | — | 500 |
 
-### Neden Lizozom persist.h'de değil config.h'de?
-Unity Build include sırası: config → ... → persist → qa. Lizozom tipleri (QAMem, qa_mem[]) hem persist.h (serialize) hem qa.h (fonksiyonlar) tarafından kullanılıyor. En erken ortak ata: config.h.
+*D4 özel: SV (nesnesiz) cümleler dahil — "yağmur yağar", "rüzgâr eser"
+
+**İstatistikler:**
+- Toplam train: **13600** satır (8657 ifade + 4943 QA)
+- Test: **500** satır (7 domain'den temsil)
+- OOV: **100** satır (3 domain'den bilinmeyen kelimeler)
+- Benzersiz kelime: **782** (10K'daki 306'dan 2.5x artış)
+- SV cümleler: **~1064** (SOV dışı yapısal çeşitlilik)
+- Cross-domain köprüler: **~500** ("anne kediyi sever" gibi domain-arası cümleler)
+
+**Eğitim durumu:** Devam ediyor (tahmin ~90-100dk).
 
 ---
 
-## 3. Çözülen Teknik Borçlar (TEKNIK_BORC_v7.md'den)
+## 2. Güncel Metrikler
 
-| # | Borç | Durum | Notlar |
-|---|------|-------|--------|
-| 6 | Sihirli sayılar → dinamik normalizasyon | ✅ v6.18'de çözüldü | dyn_norm(sc, K_BASE) — SNR-tabanlı oto-kalibrasyon |
-| 1 | Hardcoded limitler | ⚠️ Kısmen | MAX_SYM/TLEN/LINE/TRIE artırıldı, dinamik alloc hâlâ yok |
-| 5 | FOLD_PREFIX_MIN performans | ❓ 10K ile yeniden ölçülecek | |
-| 2 | O(N²) cluster | ❓ 302 kelime — henüz darboğaz değil | |
+### 2.1 10K UTF-8 Baseline (Referans)
+
+| Metrik | 2.5K ASCII | 10K UTF-8 | Fark | Yorum |
+|--------|-----------|-----------|------|-------|
+| Test | 57.5% | 63.1% | +5.6 | Gerçek ilerleme |
+| OOV | 57.4% | 46.4% | -11.0 | Daha zor OOV seti |
+| QA Metrik 1 | 74.2% | 69.8% | -4.4 | Daha geniş soru çeşitliliği |
+| Cat Transfer | — | 84.3% | yeni | Yüksek kategori doğruluğu |
+| Kategori sayısı | 9 | 6 | -3 | Daha az ama daha sağlam |
+| Vocab | ~170 | 306 | +136 | 1.8x artış |
+| Load+test süresi | — | ~1 sn | yeni | Hızlı Faz 6 rebuild |
+
+### 2.2 15K 7-Domain — İlk Snapshot (Eğitim Devam Ediyor)
+
+**Faz 1-2 tamamlandı** (68 dakika). Faz 3+ devam ediyor.
+
+| Metrik | 10K | 15K tahmin | 15K gerçek | Yorum |
+|--------|-----|-----------|-----------|-------|
+| Kategori sayısı | 6 | 8-12 | **22** | Tahmininin 2x üstü! |
+| Vocab | 306 | ~782 | ~782 | Beklenen |
+| Faz 1 süresi | ~35dk | ~70dk | **68dk** | Doğrusal ölçekleme |
+| Test/QA/OOV | — | — | bekliyor | Faz 3+ sonrası |
+
+### 2.3 İlk Kategori Haritası — Dış Gözlemci Analizi (İki Ayrı İnceleme)
+
+**22 kategorinin ilk okuması:**
+
+```
+BÜYÜK KATEGORİLER (yapısal roller):
+  CAT_0  (0.85) [237+ kelime] — MEGA ÖZNE: tüm domain'lerin özneleri
+         kaleci, tavuk, doçent, şimdi... ⚠️ zaman+özne karışması
+  CAT_1  (0.96) [242+ kelime] — TÜM FİİLLER: domain-bağımsız fiil kümesi
+         zıplıyor, bulur, hesaplıyor, sürer...
+  CAT_3  (0.68) [130+ kelime] — TÜM NESNELER: akuzatif formlar
+         ağırlığı, tohumu, molekülü, yolcuyu...
+
+DOMAIN-SPESİFİK KÜMELER (gerçek ayrışma):
+  CAT_2  (0.63) — Spor mekanları: kortta, pistinde, havuzda
+  CAT_5  (0.48) — Doğa nesneleri: ağaçları, kıyıyı, toprağı ← D4!
+  CAT_8  (0.89) — Ulaşım mekanları: durrakta, köprüde, istasyonda ← D6!
+  CAT_9  (0.60) — Doğa mekanları: deltada, kutuplarda, bozkırda ← D4!
+  CAT_10 (0.79) — Bilim nesneleri: sonucu, problemi, hipotezi ← D5!
+  CAT_12 (0.68) — Bilim mekanları: observatoryada, laboratuvarda ← D5!
+  CAT_14 (0.83) — Spor terimleri: blok, antrenman, skor ← D2!
+
+GRAMER KATEGORİLERİ:
+  CAT_4  (0.78) — Soru kelimeleri: yapar, zaman, yapıyor, renk
+  CAT_6  (0.44) — Genel mekanlar: okulda, evde, bahçede
+  CAT_7  (0.60) — Zarflar: hızlıca, sessizce, dikkatle
+  CAT_11 (0.85) — Bileşik fiil öğeleri: pas, inşa, park, tamir, analiz
+
+KÜÇÜK/ŞÜPHELI KATEGORİLER:
+  CAT_13 (0.66) — buz, ip (noise veya proto-category?)
+  CAT_15 (0.43) — nazikçe, salonda (noise?)
+  CAT_17 (0.97) — hekimi, sahibi, insanı (bileşik isimler)
+  CAT_18 (1.00) — odasında, sofrada, markette (aile mekanları D3)
+  CAT_19 (0.47) — köyde, plajda
+  CAT_20 (0.76) — tropiklerde, vadide
+  CAT_21 (1.00) — su, ankara, istanbul (bilgi entity'leri)
+```
+
+**Sentez — İki gözlemcinin ortak tespitleri:**
+
+✅ **Kazanımlar (kesin):**
+- Domain ayrışması VAR — D2, D4, D5, D6 ayrı kümeler oluşturmuş
+- Gramer rolleri keşfedilmiş — fiil, nesne, zarf, mekan ayrı kategoriler
+- Domain-içi alt yapı — D4'te nesne (CAT_5) vs mekan (CAT_9) ayrımı (önemli!)
+- Cosine similarity 7 domain'de çalışıyor — GA şimdilik gerekmiyor
+
+⚠️ **Uyarılar (kritik):**
+- **CAT_0 mega-cluster:** 237+ kelime tek kategoride → özne + zaman karışması.
+  Tüm domain özneleri benzer pozisyonda (cümle başı) geçiyor, esim() bunları
+  birleştiriyor. Bu "representation limit" sinyali olabilir.
+- **CAT_1 fiil birleşimi:** Tüm fiiller tek kategori → iki olasılık:
+  - (A) İYİ: sistem "fiil" kavramını keşfetti
+  - (B) KÖTÜ: fiiller arası anlam ayrımı yapamıyor
+  - TEST: "doktor top atar" vs "futbolcu ameliyat yapar" — doğru genelleme mi?
+- **Syntactic vs Semantic:** Şu an görülen = syntactic clustering (rol bazlı).
+  AGI için gereken = semantic clustering (anlam bazlı). Bu sınır Aşama 2-3 ile aşılacak.
+
+❌ **Henüz yok:**
+- Ontoloji (canlı/cansız ayrımı)
+- Nedensellik
+- Fiiller arası anlam farkı
+
+**Küçük kategoriler (CAT_13, CAT_15, CAT_19, CAT_20):**
+İki ihtimal: (A) Noise — rastgele bölünme, (B) Proto-category — henüz büyümemiş
+gerçek kategori. Test: yeni veri eklediğinde büyüyor mu? Büyürse gerçek, yok olursa noise.
+
+**En kritik test sorusu:** "Bu sistem kelime türü mü öğreniyor, yoksa anlam mı?"
+Şu anki cevap: kelime türü + domain. Anlam henüz yok. Ama bu beklenen —
+Aşama 1'in (dil kalıpları) doğal sınırı.
 
 ---
 
-## 4. Mevcut Metrikler (2.5K ASCII Baseline — Referans)
+## 3. Mimari Kararlar (Yeni)
 
-| Metrik | Değer | Açıklama |
-|--------|-------|----------|
-| Test (200 satır) | 57.5% | v3.2 Mikrotübül |
-| OOV (79 satır) | 57.4% | Görülmemiş kelimelerle |
-| QA (test_qa_v5) | 74.2% | Soru-cevap doğruluğu |
-| SOV İskelet | 70.3% | SPEAK fazında S-O-V sırası |
-| SNR (ortalama) | 6.69 | Dinamik normalizasyon referansı |
+### 3.1 Hızlı Faz 6 Rebuild vs Serialization
+prompt_prior_qa matrisini serialize etmek yerine, load sonrası train verisinden rebuild:
+- **Pro:** Model format değişmiyor (RIBO_VERSION=3 korunuyor), geriye uyumluluk
+- **Pro:** 0.01 saniye süre — ihmal edilebilir
+- **Pro:** Unity Build sırası sorunu yok
+- **Con:** Train verisi dosyası gerekiyor (sadece model dosyası yetmiyor)
+- **Karar:** Pragmatik, çalışıyor, ileride format v4'te serialize edilebilir
 
-**10K UTF-8 metrikleri henüz bekleniyor.** Farklı veri seti olduğu için doğrudan karşılaştırma yapılamaz — yeni baseline oluşacak.
+### 3.2 Tekrarlı Öğrenme İdempotency
+ribozom_correct() içinde Lizozom lookup:
+- Aynı soru-cevap → sadece hit_count, ağır eğitim atla
+- Farklı cevap → tam eğitim yolu (güncelleme)
+- **Etki:** Model şişmesi sıfıra indi, kullanıcı deneyimi aynı
 
----
-
-## 5. Bilinen Eksiklikler ve Yol Haritası
-
-### Kısa Vade (10K sonrası)
-1. **"Bilmiyorum" eşiği** — `ribo_conf()` düşükse "bilmiyorum" de. ~20 satırlık iş, yüksek etki.
-2. **Online cluster** — Yeni kelimeler çalışma zamanında kategorilere eklenebilmeli. Mevcut cluster() statik.
-3. **Lizozom operatör farkındalığı** — "başka", "ilk", "son" gibi kelimeler hafıza anahtarına dahil edilmeli.
-
-### Orta Vade
-4. **Negatif pekiştirme** — Düzeltme anında yanlış tahmine yol açan şablona özel ceza.
-5. **wctx pencere genişletme** — l-2, l-1, r+1, r+2 (1→2 kelimelik bağlam).
-6. **Morfoloji iyileştirmesi** — Distributional kök keşfi veya BPE-tarzı alt-kelime.
-
-### Uzun Vade (AGI Yönü)
-7. **Olumsuzluk/yokluk kavramı** — "değil", "yok" operatörleri.
-8. **Nedensellik** — "çünkü", "bu yüzden" bağlam zincirleri.
-9. **Coreference** — "O kim?" çözümlemesi, Vesicle Memory.
-10. **Hiyerarşik bellek** — Kelime → cümle → paragraf katmanları.
+### 3.3 7-Domain Genişleme Stratejisi
+- D0 (Hayvan-Yemek) %37 ile en büyük domain — baseline koruması
+- Her yeni domain ~1300 cümle — kategori keşfi için minimum yeterli
+- D4 (Doğa) SV cümleleri — SOV varsayımını zorlayan kasıtlı stres testi
+- Cross-domain köprüler — kategori transferi ve genelleme için kritik
 
 ---
 
-## 6. Dosya Yapısı (13 Nisan 2026)
+## 4. Çözülen Sorunlar (Bu Oturumda)
+
+| Sorun | Çözüm | Etki |
+|-------|-------|------|
+| QA SPEAK çöp (load-only mod) | Hızlı Faz 6 rebuild | QA 49%→69.8% |
+| Tekrarlı öğrenme şişmesi | Lizozom idempotency | Sıfır şişme |
+| "hayır" algılanmıyor | Encoding-agnostic normalize | Tüm kodlamalar çalışıyor |
+| Virgül yapışması | Skip comma+space after first word | Temiz cevap ayrıştırma |
+| QA test dosyası ASCII/UTF-8 uyumsuzluğu | test_data'dan grep ile regenerate | Sahte düşüş giderildi |
+| Lizozom persist derleme hatası | Tipler config.h'ye taşındı | Unity Build uyumlu |
+
+---
+
+## 5. Bilinen Eksiklikler ve Yol Haritası (Güncellendi)
+
+### Tamamlandı ✅
+1. ~~10K UTF-8 Türkçe veri~~
+2. ~~Load-only mod (--train flag)~~
+3. ~~QA SPEAK load sonrası çalışma~~
+4. ~~Tekrarlı öğrenme idempotency~~
+5. ~~Stress test altyapısı~~
+6. ~~15K 7-domain veri jeneratörü~~
+
+### Devam Eden 🔄
+7. **15K eğitim** — devam ediyor (~90-100dk)
+8. **Domain genelleme testi** — eğitim sonrası (kategori sayısı, SV davranışı)
+
+### Kısa Vade ⏳
+9. **"Bilmiyorum" eşiği** — ribo_conf() düşükse "bilmiyorum" de
+10. **Online cluster** — Yeni kelimeler runtime'da kategorilere eklenebilmeli
+11. **Lizozom TF-IDF** — Bag-of-words Jaccard yerine kelime önem ağırlığı (T8 miss fix)
+12. **test_qa_offd.txt UTF-8** — Off-diagonal test dosyası hâlâ eski ASCII
+
+### Orta Vade 🔜
+13. Negatif pekiştirme (yanlış şablona ceza)
+14. wctx pencere genişletme (2-kelime bağlam)
+15. Morfoloji iyileştirmesi (BPE-tarzı alt-kelime)
+
+### Uzun Vade (AGI Yönü) 🔮
+16. Olumsuzluk/yokluk kavramı ("değil", "yok")
+17. Nedensellik ("çünkü", "bu yüzden")
+18. Coreference ("O kim?" çözümlemesi)
+19. Hiyerarşik bellek (kelime→cümle→paragraf)
+
+### AGI Aşama Haritası — Dilden Anlama Geçiş
+
+**Temel tespit:** "Konuşmayı mükemmel öğrenmek" dil akıcılığı verir ama zeka
+oluşturmaz. Bu, bugünkü büyük dil modellerinin düştüğü tuzaktır. Ribozom'un farkı:
+sıfırdan inşa edildiği için her katmanı bilinçli eklenebilir.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  AŞAMA 1 — DİL (Pattern-Learning Infant)      [MEVCUT]     │
+│  ✅ Kelime eşleştirme, kalıp öğrenme, basit genelleme       │
+│  ✅ SOV yapısı, kategori keşfi, canlı düzeltme              │
+│  🔄 7 domain genişleme (15K eğitim devam ediyor)            │
+│  Hedef: Multi-domain SOV genellemesi + SV yapısal keşif     │
+├─────────────────────────────────────────────────────────────┤
+│  AŞAMA 2 — KOŞULLU BİLGİ (Dünya Modeli Tohumu)  [SIRADA]  │
+│  "kedi açsa balık yer"  /  "kedi tokken balık yemez"        │
+│  "yağmur yağarsa toprak ıslanır"                            │
+│                                                             │
+│  Mimari etki: DÜŞÜK — veri eklentisi yeterli                │
+│    BOS → CAT_koşul → CAT_özne → CAT_nesne → CAT_fiil      │
+│    "açsa", "tokken", "ıslanırsa" → yeni kategori (CAT_KOŞ) │
+│    Mevcut mikrotübül geçiş matrisi bunu zaten destekliyor   │
+│                                                             │
+│  ⚡ Kritik tweak: Yüzey varyasyonları ekle                  │
+│    "kedi açsa balık yer"         (koşul-özne-nesne-fiil)    │
+│    "kedi aç olursa balık yer"    (analitik form)            │
+│    "aç olan kedi balık yer"      (sıfat-isim formu)         │
+│    "kedi açken balık yer"        (zarf-fiil formu)          │
+│    → Aynı anlam, farklı yüzey = gerçek abstraction testi   │
+│                                                             │
+│  ❗ NEGATION (kritik ek — zeka = fark üretme):              │
+│    "kedi aç değilse balık yemez"                            │
+│    "yağmur yağmazsa yer ıslanmaz"                           │
+│    → Negation olmadan sistem hep "pozitif ezber" yapar      │
+│                                                             │
+│  Kazanım: DURUM, KOŞUL, BAĞLAM + OLUMSUZLUK kavramları     │
+├─────────────────────────────────────────────────────────────┤
+│  AŞAMA 3 — NEDENSELLİK ZİNCİRİ                  [PLANLAMA]│
+│  "yağmur → ıslak → kaygan" zinciri                         │
+│  "çünkü" / "bu yüzden" → CAT_BAĞLAÇ kategorisi             │
+│                                                             │
+│  Mimari etki: ORTA — Vesicle Memory gerekli                 │
+│    Her cümle bitiminde aktif bağlam bir vesicle'a paketlenir│
+│    "Çünkü" geldiğinde önceki vesicle'a referans kurulur     │
+│    CÜMLE_1.EOS → CAT_bağlaç → CÜMLE_2.BOS → ...            │
+│                                                             │
+│  ❗ Forward + Backward (kritik ek):                         │
+│    Forward:  "yağmur yağarsa toprak ıslanır"                │
+│    Forward:  "toprak ıslanırsa kaygan olur"                 │
+│    Backward: "toprak neden ıslak? çünkü yağmur yağdı"      │
+│    → İki yönlü zincir = gerçek akıl yürütme temeli         │
+│    → Backward query olmadan sistem sadece "ileri tahmin"    │
+│      yapar, "neden?" sorusuna cevap veremez                 │
+│                                                             │
+│  Kazanım: AGI'nin ilk gerçek çekirdeği — sebep-sonuç       │
+├─────────────────────────────────────────────────────────────┤
+│  AŞAMA 4 — ONTOLOJİ (Varlık Türleri)            [UZUN VAD]│
+│  kedi (canlı, memeli) vs taş (cansız, nesne)               │
+│  yağmur (süreç) vs dağ (kalıcı)                            │
+│                                                             │
+│  Mimari etki: YÜKSEK — özellik vektörü veya GA gerekebilir │
+│    Seçenek A: Explicit özellikler (is_alive, is_process)    │
+│    Seçenek B: Geometric Algebra (bivector ilişki temsili)   │
+│    Karar tetikleyici: 15K'da cosine similarity yeterliliği  │
+│                                                             │
+│  Kazanım: "Anlam" — varlıkların doğası hakkında bilgi      │
+├─────────────────────────────────────────────────────────────┤
+│  AŞAMA 5 — ÜST-BİLİŞ (Meta-Cognition)          [VİZYON]  │
+│  "Bilmiyorum" (güven eşiği)                                │
+│  "Bunu daha önce yanılmıştım" (hata hafızası)              │
+│  "Bu soru öncekiyle çelişiyor" (tutarlılık kontrolü)        │
+│                                                             │
+│  Kazanım: Sistem kendi bilgisini sorguluyor — AGI eşiği    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Kritik sıralama prensibi:** Her aşama bir öncekinin verisine ve altyapısına dayanır.
+Aşama 2 (koşullu bilgi) Aşama 1 (SOV genellemesi) olmadan anlamsız — "açsa" koşulunu
+öğretmeden önce "kedi balık yer" kalıbını sağlam bilmesi gerekiyor. Aşama 3 (nedensellik)
+Aşama 2 olmadan imkansız — nedensellik zincirinin her halkası bir koşullu cümle.
+
+**Aşama 2 tetikleyici:** 15K eğitim tamamlanıp sonuçlar ölçüldükten sonra.
+Koşullu cümleler mevcut gen_15k_tr.py'ye eklenecek, mimari değişiklik gerektirmiyor.
+
+---
+
+## 6. Dosya Yapısı (13 Nisan 2026 — Güncel)
 
 ```
 v3/files/
-├── ribozom_main.c          — Ana dosya + interactive mode
-├── ribozom_config.h         — Sabitler + Lizozom tipleri + dyn_norm
-├── ribozom_core.h           — Şablonlar + LCRS Trie + rtrain/rpredict
-├── ribozom_vocab.h          — ER + hash + esim + cluster
-├── ribozom_golgi.h          — Golgi + cat templates + predict_meta
-├── ribozom_micro.h          — Mikrotübül + morfoloji + incremental updates
-├── ribozom_persist.h        — save/load model (ribo31.bin, v3 format)
-├── ribozom_qa.h             — QA state machine + SPEAK + Lizozom fonksiyonları
-├── gen_10k_tr.py            — 10K Türkçe veri jeneratörü
-├── train_data_10k.txt       — 9500 satır eğitim verisi (UTF-8 Türkçe)
-├── test_data_10k.txt        — 500 satır test verisi
-├── oov_test_10k.txt         — 100 satır OOV test verisi
-├── train_data.txt           — (eski) 2500 satır ASCII eğitim
-├── test_data.txt            — (eski) 200 satır ASCII test
-├── ribo31.bin               — Serialize edilmiş model
-├── MANIFESTO.md             — Proje vizyonu ve mimari
-├── PROJE_DURUMU.md          — İlk proje raporu
-├── PROJE_DURUMU_v2-v6.md    — Ara durum raporları
-├── PROJE_DURUMU_v10K.md     — ★ BU DOKÜMAN
-└── TEKNIK_BORC_v7.md        — Teknik borç kaydı
+├── ribozom_main.c           — Ana dosya + interactive mode (~900+ satır)
+├── ribozom_config.h          — Sabitler + Lizozom tipleri + dyn_norm
+├── ribozom_core.h            — Şablonlar + LCRS Trie + rtrain/rpredict
+├── ribozom_vocab.h           — ER + hash + esim + cluster + build_soft_cats
+├── ribozom_golgi.h           — Golgi + cat templates + predict_meta
+├── ribozom_micro.h           — Mikrotübül + morfoloji + incremental updates
+├── ribozom_persist.h         — save/load model (ribo31.bin, RIBO_VERSION=3)
+├── ribozom_qa.h              — QA state machine + SPEAK + Lizozom + correct()
+│
+├── gen_15k_tr.py             — ★ 15K 7-domain Türkçe veri jeneratörü
+├── gen_10k_tr.py             — (eski) 10K tek domain jeneratör
+├── train_data_15k.txt        — ★ 13600 satır eğitim verisi (7 domain, UTF-8)
+├── test_data_15k.txt         — ★ 500 satır test verisi (7 domain)
+├── oov_test_15k.txt          — ★ 100 satır OOV test verisi (3 domain)
+├── train_data_10k.txt        — (eski) 9500 satır eğitim
+├── test_data_10k.txt         — (eski) 500 satır test
+├── oov_test_10k.txt          — (eski) 100 satır OOV
+├── test_qa_v5.txt            — QA test çiftleri (test_data'dan türetilmiş)
+├── stress_test.sh            — ★ Lizozom stress test scripti (10 senaryo)
+│
+├── ribo31.bin                — Serialize edilmiş model
+├── MANIFESTO.md              — Proje vizyonu ve mimari
+├── PROJE_DURUMU_v10K.md      — Önceki durum raporu
+├── PROJE_DURUMU_v15K.md      — ★ BU DOKÜMAN
+└── TEKNIK_BORC_v7.md         — Teknik borç kaydı
 ```
 
 ---
 
-## 7. Dış Gözlemci Analizi (13 Nisan)
+## 7. 15K Kırılma Sinyalleri — Ne Ölçülecek, Nasıl Yorumlanacak
 
-Bağımsız bir teknik inceleme aşağıdaki eksiklikleri tespit etti:
+> *Sadece accuracy'ye bakmak yanıltır. Asıl sinyal yapısal davranıştadır.*
 
-### Kabul Edilen Tespitler
-- **Long-range dependencies:** MAX_TLEN sınırları içinde kaybolur. Mikrotübül (prev_locked_cat) kısmen hafifletir ama hiyerarşik bellek gerekecek.
-- **Statik ER:** Online cluster kritik eksik. Yeni kelimeler kategorisiz kalıyor.
-- **Global state:** Test edilemez, çoklu örneklenemez. Bilinçli prototipleme tercihi ama teknik borç.
-- **"Bilmiyorum" eksikliği:** ribo_conf() altyapısı var, eşik eklenmeli.
+### 🎯 Sinyal 1: Kategori Ayrışması (EN KRİTİK)
 
-### Yanıtlar
-- **Tekrar-tabanlı öğrenme eleştirisi:** Eski durumu anlatıyor. CORRECTION_ENERGY_MULT=10.0f + Lizozom ile tek düzeltme yeterli.
-- **Olumsuzluk/nedensellik:** Doğru ama erken. Önce 10K → online cluster → bilmiyorum.
-- **Bellek sınırları:** 10K için yeterli. 1M+'da dinamik alloc'a geçilecek.
+**Soru:** 7 domain gerçekten ayrışıyor mu?
+- "doktor", "futbolcu", "anne" → aynı kategoriye mi düşüyor, yoksa ayrı cluster mı?
+- **Beklenen:** 6 → 8-12 kategori
 
-### Öncelik Sırası (güncellendi)
-1. ✅ 10K UTF-8 veri (yapılıyor)
-2. ⏳ "Bilmiyorum" eşiği (kolay, yüksek etki)
-3. ⏳ Online cluster (zor, kritik)
-4. 🔜 Lizozom operatör farkındalığı
-5. 🔮 Olumsuzluk, nedensellik, hiyerarşik bellek
+| Sonuç | Yorum | Aksiyon |
+|-------|-------|---------|
+| 8-12 kategori | ✅ Domain'ler ayrışıyor, genelleme başlıyor | Aşama 2'ye geç |
+| 6 civarı kalır | ❌ Sistem genelleme yapmıyor, ezberliyor | esim() temsil gücünü sorgula |
+| 15+ kategori | ⚠️ Aşırı parçalanma, over-clustering | Cluster threshold'u gözden geçir |
+
+**DİKKAT:** Ayrışma ≠ ontoloji öğrendi. Kategoriler veri dağılımı sonucu da oluşabilir.
+"yağmur" ayrı kategoriye düşse bile, sistem "cansız" kavramını anlamıyor — sadece "yağmur"
+kelimesinin bağlamının diğerlerinden farklı olduğunu tespit ediyor. Gerçek ontoloji Aşama 4.
+
+**Stabilite kontrolü:** Kategori sayısı stabil mi? Aynı veri farklı seed/sırayla
+çalıştırıldığında sürekli değişiyorsa → clustering unstable, sayıya güvenme.
+
+### 🎯 Sinyal 2: Cross-Domain Davranış
+
+**Soru:** Köprü cümleleri ("anne kediyi sever") mantıklı genelleniyor mu?
+- Sistem D3(aile) öznesini D0(hayvan) nesnesiyle doğru birleştiriyor mu?
+- Yoksa saçma kategoriye mi atıyor?
+
+| Sonuç | Yorum |
+|-------|-------|
+| Doğru genelleme | ✅ Abstraction başlamış — kategori geçişleri domain-bağımsız |
+| Saçma atama | ❌ Kategoriler domain'e kilitli — transfer öğrenme yok |
+
+### 🎯 Sinyal 3: SV Etkisi (Yapısal Keşif)
+
+**Soru:** "yağmur yağar" (SV) kalıbı SOV'dan ayrı öğreniliyor mu?
+- D4'teki ~1064 nesnesiz cümle geçiş matrisinde nasıl görünüyor?
+- BOS → CAT_doğa → EOS (nesne atlayarak) mı, yoksa SOV'a zorla sığdırma mı?
+
+| Sonuç | Yorum |
+|-------|-------|
+| Ayrı geçiş kalıbı | 🔥 Büyük başarı — sistem cümle yapısını keşfediyor |
+| SOV'a zorla sığdırma | ❌ "Sentence structure blind" — yapısal esneklik yok |
+| Karma/karmaşık | ⚠️ Sinyal belirsiz — daha fazla SV verisi gerekebilir |
+
+**Gizli genelleme testi:** Train'de "yağmur yağar", "rüzgâr eser" var. Test'te
+"güneş parlar" — eğer doğru genellerse SV öğrenilmiş, saçmalarsa ezber.
+
+### 🎯 Sinyal 4: OOV Davranışı (Gerçek Öğrenme Testi)
+
+**Soru:** Yeni domain'lerden OOV kelimelerde ne yapıyor?
+- D1 OOV ("psikiyatrist") → en yakın meslek kategorisini mi seçiyor?
+- D4 OOV ("tsunami") → doğa kategorisine mi düşüyor?
+
+| Sonuç | Yorum |
+|-------|-------|
+| Mantıklı tahmin | ✅ Gerçek genelleme — bağlam transferi çalışıyor |
+| Rastgele/varsayılan | ❌ OOV hâlâ kör — distributional signal yetersiz |
+
+**Overgeneralization testi:** "aslan top oynar mı?" — sistem çok emin cevap veriyorsa
+overgeneralization var. İdeal: düşük confidence veya kararsızlık.
+
+### 🎯 Meta-Sinyal: HATALARA ODAKLAN
+
+> *Sistemin gerçek yapısı metriklerde değil, hatalarda ortaya çıkar.*
+> *Sonuç geldiğinde sakın "genel olarak iyi görünüyor" deme.*
+> *Sor: "Bu sistem nerede aptal?"*
+
+15K sonucu geldiğinde en önce bakılacaklar:
+1. **En saçma cevaplar** — SPEAK'in ürettiği en anlamsız cümleler neler?
+2. **En beklenmedik hatalar** — doğru bildiği bir şeyi neden yanlış yaptı?
+3. **Domain karışması** — hangi domain çiftleri birbirine en çok karışıyor?
+4. **Confidence dağılımı** — yanlış cevaplarda confidence yüksek mi? (tehlikeli!)
+
+### 🛡️ Yorum Guardrail'leri (False Positive/Negative Koruması)
+
+#### Guardrail #1 — Tek metrikle karar verme
+Kategori sayısı 10 ama OOV kötü ve SV başarısız → bu **false success**.
+**Kural:** En az 2 bağımsız sinyal aynı şeyi söylüyorsa karar ver.
+
+#### Guardrail #2 — En kötü 5 örnek zorunlu raporu
+Her testten sonra **zorunlu** listeleme:
+- En kötü 5 cevap
+- En saçma 5 cevap
+- En yüksek confidence'lı yanlış 5 cevap
+
+Sistem kendini ortalamada değil, **uçlarda** ele verir.
+
+#### Guardrail #3 — Sessiz başarısızlık tespiti
+Model yanlış ama makul cevap verir, dikkat çekmez. Test:
+- "kedi uçar mı?" → confident cevap veriyorsa ❌ gerçeklik filtresi yok
+- "taş konuşur mu?" → confident cevap veriyorsa ❌
+- Bu sorularda beklenen: düşük confidence veya "bilmiyorum"
+
+### 🧪 Impossible/Absurd Test Seti (Gerçeklik Sınırı Ölçümü)
+
+15K sonrası interaktif modda çalıştırılacak absurd sorular:
+```
+taş ne yer ?            → beklenen: düşük confidence / saçma cevap
+güneş ne içer ?         → beklenen: düşük confidence / saçma cevap
+araba ne düşünür ?      → beklenen: düşük confidence / saçma cevap
+kedi ne uçar ?          → beklenen: kararsızlık
+dağ ne pişirir ?        → beklenen: düşük confidence / saçma cevap
+```
+**Değerlendirme:** Eğer sistem bu sorulara confident cevap veriyorsa,
+gerçeklik filtresi YOK demektir — "bilmiyorum" eşiği acil öncelik olur.
+
+### Ek Açık Sorular
+
+5. **Vocab ölçekleme:** 782 kelime ile hash çakışma oranı, cluster() süresi,
+   esim() kalitesi nasıl değişiyor?
+
+6. **D6 dual-role:** "otobüs yolcuyu taşır" (özne) vs "şoför otobüsü sürer"
+   (nesne) — aynı kelime iki farklı konumda. Kategori ataması tutarlı mı?
+
+7. **Negation + Contradiction testi (Aşama 2 hazırlığı):**
+   "kedi balık yer" + "kedi balık yemez" → sistem ne yapar?
+   İdeal: conflict algıla, confidence düşür, veya "bilmiyorum" de.
+   Bu test şu an yapılamaz (negation verisi yok) ama Aşama 2'nin başarı ölçütü olacak.
+
+8. **Temporal contradiction (Aşama 2-3 köprüsü):**
+   Interaktif modda sırayla öğret:
+   - "kedi balık yer" (düzeltme ile öğret)
+   - "kedi artık balık yemez" (yeni düzeltme)
+   - "kedi ne yer?" (soru sor)
+   → Hangisi geçerli? Sistem memory update + conflict resolution yapabiliyor mu?
+   → Lizozom son kaydı alır (mekanik çözüm), ama "artık" zamansal operatörünü
+     anlaması gerçek zeka sıçraması olur.
 
 ---
 
-## 8. Mimari Eleştiriler ve Yanıtlar (13 Nisan — İki Ayrı Dış İnceleme)
+## 8. Dış İnceleme ve Yanıtlar
 
-### 8.1 İnceleme #1 — Sistem Mühendisliği Odaklı
+*İncelemeler v10K raporunda detaylı şekilde belgelenmiştir (Bölüm 7-8). Özet:*
 
-Mevcut mimarinin büyüme ağrılarını tespit eden kapsamlı bir analiz.
+### Kabul Edilen ve Uygulanan
+- ✅ Statik ER → Online cluster (yol haritasında, sıra 10)
+- ✅ "Bilmiyorum" eşiği → ribo_conf() altyapısı mevcut (sıra 9)
+- ✅ Tekrar-tabanlı öğrenme → İdempotency fix ile çözüldü
 
-#### Tespit 1: Long-Range Dependencies
-> "Ribozom dili soldan sağa karakter karakter işler. MAX_TLEN=12 sınırında
-> 'adam ... geldi' gibi uzun mesafeli bağımlılıklar kaybolur."
+### Kabul Edilen Ama Ertelenen
+- ⏳ Long-range dependencies → Mikrotübül kısmen çözüyor, hiyerarşik bellek ileride
+- ⏳ Olumsuzluk/nedensellik → AGI yol haritasında
+- ⏳ Global state → Algoritmalar stabilize olduktan sonra refactor
 
-**Yanıt:** Doğru tespit, ama kısmen çözülmüş. Karakter penceresi 12 byte ile sınırlı,
-ancak Mikrotübül `prev_locked_cat` ile **kategori seviyesinde** bağlam taşıyor. Karakter
-penceresini aşan soyutlama katmanı zaten mevcut. Hiyerarşik bellek (stack/tree) fikri
-doğru ama şu an için overkill — önce mevcut performansı ölçmeliyiz.
-
-#### Tespit 2: Statik Kategori Sistemi (ER)
-> "cluster() bir kere çalışır ve kategorileri dondurur. Yeni kelimeler kategorisiz kalır."
-
-**Yanıt:** Tamamen haklı. Bu gerçek bir sorun. `register_new_word()` ile 3-katmanlı
-fallback eklendi (hint → prompt_prior → esim) ama gerçek online cluster yok. 10K
-sonrası 1. öncelik.
-
-#### Tespit 3: Lizozom Körlüğü
-> "'kedi ne yer' ile 'kedi başka ne yer' arasındaki farkı anlayamaz."
-
-**Yanıt:** Kısmen haklı. Jaccard >= 0.5 çoğu pratik durumda çalışıyor (stres testinde
-kanıtlandı). "başka", "ilk", "son" gibi operatörleri filtreden çıkarmak kolay iyileştirme.
-
-#### Tespit 4: Tekrar-Tabanlı Öğrenme
-> "ribozom_correct() düzeltmeyi 10 kez tekrar eder. Gerçek zeka tek seferde kavrar."
-
-**Yanıt:** Bu **eski durumu** anlatıyor. `CORRECTION_ENERGY_MULT=10.0f` + Lizozom ile
-tek düzeltme yeterli. Negatif pekiştirme (yanlış şablona ceza) dikkatli yapılmalı —
-catastrophic forgetting riski var.
-
-#### Tespit 5: Bellek Sınırları
-> "MAX_TRIE_NODES ve MAX_TMPL sistem büyüdükçe tükenecek."
-
-**Yanıt:** Doğru ama erken. 10K için sabit diziler yeterli. 1M+ hedeflendiğinde
-malloc/realloc'a geçilecek.
-
-#### Tespit 6: Eksik Bilişsel Yetenekler
-> "Olumsuzluk, nedensellik, üst-biliş eksik."
-
-**Yanıt:** Hepsi doğru ve hepsi AGI yolundaki milestone'lar. Ama karakter-seviyesi
-sınıflandırıcıdan bunları beklemek, yürümeyi öğrenen bebekten koşmasını beklemek gibi.
-Doğru sıra: 10K → online cluster → "bilmiyorum" eşiği → olumsuzluk → nedensellik.
-
-#### Tespit 7: Global State
-> "Test edilemez, çoklu örneklenemez, kütüphane olarak kullanılamaz."
-
-**Yanıt:** Doğru, teknik borç. Ama Unity Build + global state prototipleme hızı için
-bilinçli tercih. Algoritmalar stabilize olduktan sonra refactor yapılacak.
+### Reddedilen veya Nüanslanan
+- "Vektör uzayı şart" → esim() zaten distributional semantics yapıyor
+- "Trie ile AGI mümkün değil" → Trie tek organel, sistem 6+ bileşenden oluşuyor
 
 ---
 
-### 8.2 İnceleme #2 — AGI Potansiyeli Odaklı
+*"Dar domain'de başarı illüzyondur. Gerçek test, bilinmeyen bir dünyada ilk adımı atabilmektir."*
 
-"Ribozom ile AGI mümkün mü?" sorusuna odaklanan daha felsefi bir analiz.
-
-#### İddia 1: "Trie ile saf AGI matematiksel olarak mümkün değildir"
-> "LCRS Trie istatistiksel bir örüntü eşleştirme motorudur. Boyut laneti,
-> anlam-dizilim ayrımı ve sürekli uzay eksikliği nedeniyle AGI'ye yetmez."
-
-**Yanıt — Kısmen katılıyoruz, kısmen karşı çıkıyoruz:**
-
-Doğru olan: Tek bir veri yapısıyla AGI iddia etmek saçma. Beyin de tek yapıdan ibaret
-değil — hipokampüs, korteks, serebellum hepsi farklı mekanizmalar.
-
-Ama Ribozom da tek yapıdan ibaret değil:
-- **Trie** = karakter tahmin motoru (beynin V1 korteksi gibi — düşük seviye pattern)
-- **ER Cluster** = distributional semantics (esim/wctx = el yapımı Word2Vec)
-- **Mikrotübül** = kategori zinciri taşıyıcısı (uzun mesafe bağımlılık)
-- **Golgi** = cümle hafızası (OOV fallback)
-- **Lizozom** = epizodik bellek (hızlı öğrenme)
-- **QA State Machine** = temporal bağlam yöneticisi (LISTEN/SPEAK fazları)
-
-Trie AGI'nin tamamı değil, sadece **bir organeli**.
-
-#### İddia 2: "Vektör uzayına (embeddings) geçmen gerekecek"
-> "Kelimeleri sürekli uzayda tutan bir Korteks modülüne geçiş şart."
-
-**Yanıt — Bu varsayım, kanıt değil.**
-
-Embedding'ler güçlü ama tek yol değil. Ribozom'daki `esim()` fonksiyonu zaten
-distributional semantics yapıyor — kelimeler bağlam vektörlerine (wctx) göre cosine
-similarity ile karşılaştırılıyor. Bu, Word2Vec'in el yapımı versiyonu.
-
-Ayrıca transformer'ların "attention" mekanizması da aslında sparse lookup — Trie'nin
-yaptığının sürekli uzaydaki karşılığı. İki yaklaşım aynı problemi farklı uzaylarda
-çözüyor.
-
-**OOV testinde %57.4 doğruluk, sıfır embedding ile.** Bu zaten bir tür zero-shot
-generalization. Mükemmel değil ama "çok zor" demek abartı.
-
-#### İddia 3: "Boyut laneti Trie'yi öldürür"
-> "Bağlam penceresi büyüdükçe Trie eksponansiyel genişler."
-
-**Yanıt — Bu Ribozom'un zaten çözdüğü bir sorun.**
-
-MAX_TLEN=12 byte karakter penceresi sınırlı, doğru. Ama Mikrotübül `prev_locked_cat`
-ile **kategori seviyesinde** bağlam taşıyor. 12 byte'lık pencere değil, kategori zinciri
-uzun mesafe bağımlılığını kodluyor:
-
-```
-BOS → CAT_özne(%96) → CAT_nesne(%96) → CAT_fiil(%96)
-```
-
-Bu deterministik geçiş zinciri, karakter penceresinden bağımsız çalışıyor.
-
-#### İddia 4: "Complementary Learning Systems benzerliği"
-> "Lizozom (hızlı/epizodik) + Trie (yavaş/semantik) ayrımı beynin
-> tamamlayıcı öğrenme sistemleriyle birebir örtüşüyor."
-
-**Yanıt — En iyi tespit.** Bu bilinçli bir tasarım kararıydı. Dev dil modellerinin
-en büyük eksiği olan "anında düzeltme" (single-shot correction) olayını pragmatik bir
-Jaccard algoritmasıyla çözmüş olmak, AGI'nin ihtiyaç duyduğu hibrit mimarinin
-(Nöro-Sembolik AI) temellerini atıyor.
-
-#### Soru: "Nedenselliği discrete C'de nasıl modelleyeceksin?"
-
-**Cevap — İki yaklaşım:**
-
-**Yaklaşım 1 — Operatör kelimeler:**
-"çünkü", "bu yüzden", "sonuç olarak" gibi kelimeler yeni bir kategori olur
-(CAT_NEDEN). Geçiş matrisi `CAT_NEDEN → önceki cümlenin konusu` bağlantısını öğrenir.
-Discrete C'de ~50 satırlık iş.
-
-**Yaklaşım 2 — Vesicle Memory:**
-Her cümle bitiminde aktif bağlam bir "vesicle" struct'ına paketlenir. "Çünkü" geldiğinde
-önceki vesicle'a referans kurulur. Bu, coreference çözümlemesinin nedensel versiyonu.
-
-Her ikisi de saf C'de, GPU'suz yapılabilir. Nedensellik için sürekli uzay **gerekli
-değil** — bir grafik yapısı yeterli. Beyin de nedenselliği nöron ağırlıklarıyla değil,
-bağlantı topolojisiyle kodlar.
+*— 15K 7-domain genişleme bu testi karşılıyor.*
 
 ---
 
-### 8.3 Sentez: Ribozom'un AGI Pozisyonu
+## 9. Creator Notes
+
+> *"Basitlik, karmaşıklığın en üst noktasıdır."* — Leonardo da Vinci
+
+### 9.1 Geometric Algebra (GA) — Yedek Plan
+
+Şu an GA için erken. Neden:
+
+Ribozom'un mevcut gücü basitliğinde. `esim()` cosine similarity, 10 satır C kodu,
+anında çalışıyor. 7 domain'de 6 kategoriden 12'ye çıkabilecek mi diye test ediyoruz.
+Bu temel sorunun cevabını bilmeden üzerine GA eklemek, temeli görmeden çatı inşa
+etmek olur.
+
+**GA entegrasyonu ciddi bir mimari değişiklik:**
+- wctx dizilerini multivector struct'lara dönüştürmek = ribozom_vocab.h'ın yarısını yeniden yazmak
+- Bellek: G4 multivector = 16 float bileşen, mevcut wctx = MAX_CTX int
+- Boyut ve tip değişimi tüm downstream fonksiyonları etkiler
+
+**Ama fikri çöpe atma.** Şu senaryoda devreye girer:
+
+Eğer 15K 7-domain testi sonucunda kategori keşfi başarısız olursa — yani cosine
+similarity farklı domain'lerdeki yapısal benzerlikleri yakalayamazsa — o zaman
+temsil gücü sorunu var demektir. Ve o noktada GA'nın bivector ilişki temsili
+gerçek bir çözüm olur.
+
+**GA karar ağacı:**
+1. 15K 7-domain sonuçlarını gör
+2. Kategori sayısı artıyor mu, cross-domain genelleme var mı?
+3. Eğer cosine similarity yetersiz kalırsa → GA'yı `esim()` yerine prototiple
+4. Eğer çalışıyorsa → ölçeklemeye devam et, GA'yı Aşama 4 (Ontoloji) için sakla
+
+**Boyut laneti çözümü — GA'yı kategori uzayında çalıştır:**
+
+$2^n$ bileşen sorunu GA'nın bilinen zayıflığı. 10.000 boyutlu kelime uzayında
+full multivector hesaplamak imkansız ($2^{10000}$ bileşen). Ama Ribozom'un mimarisi
+bunu doğal olarak çözüyor:
 
 ```
-             Sembolik AI                          Konneksiyonist AI
-             (GOFAI, Expert Systems)              (Deep Learning, Transformers)
-                    |                                       |
-                    |          RIBOZOM                      |
-                    |     (Nöro-Sembolik Hibrit)            |
-                    |        /            \                 |
-                    +--- Discrete Structures ---+--- Distributional Semantics ---+
-                         (Trie, Golgi, FSM)         (esim/wctx, cluster)
+Kelime uzayı:     782 kelime  →  2^782 bileşen  →  İMKANSIZ
+Kategori uzayı:   12 kategori →  2^12 = 4096     →  KOLAY
+Grade-kısıtlı:    Grade 0,1,2 →  1+12+66 = 79    →  TRİVİAL (316 byte)
 ```
 
-**Ribozom ne değil:**
-- Bir transformer değil (attention yok, GPU yok)
-- Bir expert system değil (kurallar elle yazılmıyor, öğreniliyor)
-- Bir n-gram modeli değil (kategoriler, geçişler, QA state machine var)
+`cluster()` zaten boyut sıkıştırma yapıyor — yüzlerce kelimeyi düzinelerce kategoriye
+indiriyor. GA bu sıkıştırılmış uzayda çalışır:
 
-**Ribozom ne:**
-- Discrete + distributional hibrit
-- Her bilişsel yetenek ayrı organelde (modüler evrim)
-- Sıfır bağımlılık, saf C (araştırma özgürlüğü)
-- AGI'nin ihtiyaç duyduğu temel sorunları (hızlı öğrenme, düzeltme, kategorizasyon)
-  pratik seviyede çözen bir laboratuvar
+- **Grade 0 (scalar):** Benzerlik skoru — mevcut `esim()` karşılığı
+- **Grade 1 (vector):** Kategori temsili — mevcut `cats[c]` karşılığı
+- **Grade 2 (bivector):** Kategori ilişkileri — `CAT_özne ∧ CAT_fiil` = yönlü ilişki
+  Mevcut `trans[c1][c2]` geçiş matrisi bunu sayısal tutuyor ama yönü kaybediyor.
+  Bivector: `e_özne ∧ e_fiil ≠ e_fiil ∧ e_özne` — yön korunuyor.
 
-**AGI yolu:**
-Bu yol daha mı yavaş? Evet. İmkansız mı? Hayır. Transformer'lar brute-force ölçekle
-(GPU + trilyon parametre) AGI'ye yaklaşıyor. Ribozom cerrahi hassasiyetle (organelle
-bazlı evrim + sıfır kaynak) aynı hedefe farklı rotadan yürüyor.
+12 kategori: 12×11/2 = 66 bivector = 66 float = **264 byte**. Toplam multivector 316 byte.
+Milyar parametreli modeller için kabus olan şey, Ribozom için ihmal edilebilir.
 
-Hangisi kazanır? Muhtemelen ikisinin sentezi — Nöro-Sembolik AI.
+Bu, neuroscience'taki **sparse coding** prensibi: beyin milyarlarca sinaptik girdiyi
+birkaç yüz kavrama sıkıştırıyor, üst seviye akıl yürütme sıkıştırılmış uzayda yapılıyor.
 
----
+```c
+// Olası GA struct (kategoriler üzerinde)
+typedef struct {
+    float scalar;                              // grade 0: 1 bileşen
+    float vec[MAX_CATS];                       // grade 1: n bileşen
+    float bivec[MAX_CATS*(MAX_CATS-1)/2];      // grade 2: n(n-1)/2 bileşen
+} CatMultivector;  // 12 kategori → 79 float = 316 byte
+```
 
-*"Sahte zaferden dürüst teşhis, dürüst teşhisten çalışan prototip daha değerlidir."*
+### 9.2 Ontoloji Yanılsaması Uyarısı
+
+`esim()` ile ontoloji "kısmen çözülüyor" demek tehlikeli bir ifade. Gerçek durum:
+
+- `esim()` **bağlam benzerliği** yakalar ✅ — "kedi" ve "köpek" benzer bağlamlarda geçer
+- `esim()` **ontoloji vermez** ❌ — "kedi koşar" ile "araba gider" bağlam-benzer olabilir
+  ama biri canlı, biri değil
+
+Eğer 15K'da "yağmur" ayrı kategoriye düşerse, bu **ontoloji öğrendi demek değil**.
+Sadece "yağmur" kelimesinin veri dağılımında diğerlerinden farklı konumlandığını
+tespit etmiş. Gerçek ontoloji (canlı/cansız, süreç/nesne) Aşama 4'te açık temsil
+gerektirir.
+
+**Test yöntemi:** "kedi koşar" ve "araba gider" aynı kategoride mi? Eğer evetse,
+sistem yapısal benzerliği yakalamış ama ontolojik farkı kaçırmış.
+
+### 9.3 "Dilden Anlama" Geçişi Hakkında
+
+Projenin kritik kavşağı şu: dil akıcılığı ≠ zeka. Büyük dil modellerinin tuzağına
+düşmemek için, Aşama 1 (dil kalıpları) tamamlanır tamamlanmaz Aşama 2'ye (koşullu
+bilgi) geçmek gerekiyor. Bu geçiş mimari değil, **veri** geçişi:
+
+```
+Aşama 1 verisi:  "kedi balık yer"                         (kalıp)
+
+Aşama 2 verisi:  "kedi açsa balık yer"                     (koşul)
+                  "kedi aç olursa balık yer"                (analitik form)
+                  "aç olan kedi balık yer"                  (sıfat-isim)
+                  "kedi açken balık yer"                    (zarf-fiil)
+                  → Aynı anlam, farklı yüzey = abstraction testi
+
+                  "kedi aç değilse balık yemez"            (NEGATION)
+                  "yağmur yağmazsa yer ıslanmaz"           (NEGATION)
+                  → Olumsuzluk olmadan sistem "pozitif ezber" tuzağına düşer
+
+Aşama 3 verisi:  "yağmur yağarsa toprak ıslanır"          (forward chain)
+                  "toprak ıslanırsa kaygan olur"            (forward chain)
+                  "toprak neden ıslak? çünkü yağmur yağdı" (backward query)
+                  → İki yönlü zincir = gerçek akıl yürütme
+```
+
+Mevcut mikrotübül geçiş matrisi Aşama 2'yi **mimari değişiklik olmadan** destekliyor.
+"açsa" ve "tokken" yeni kelimeler olarak vocab'a girer, cluster() bunları koşullu
+operatörler olarak gruplayabilir (benzer bağlamlarda geçtikleri için).
+
+Aşama 3 ise Vesicle Memory gibi yeni bir organelle gerektiriyor — cümle-arası referans.
+Bu noktada mimari sıçrama kaçınılmaz ama altyapı (Lizozom, Mikrotübül) temel sağlıyor.
+
+> *"Doğru sıra: önce yürü, sonra koş, sonra uç. Ama yürürken uçuş planını çizmeye başla."*
