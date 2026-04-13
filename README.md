@@ -48,17 +48,6 @@ Sistem **3700+ satırlık saf C kodunun** modüler bir Unity Build mimarisiyle b
 3. **Golgi Aygıtı (`ribozom_golgi.c`):** Tahmin öncesi kategori bazlı şablon hizalaması.
 4. **UTF-8 Byte-Level İşleme:** Karakter kodlamalarını kaba kuvvetle değil, byte dizilimleri üzerinden deterministik olarak işler.
 
-## 🚀 Başlangıç (Getting Started)
-
-Projeyi derlemek için standart bir GCC derleyicisi yeterlidir:
-
-```bash
-# Projeyi derle
-gcc -O2 -o ribozom ribozom_main.c -lm
-
-# 10K eğitim verisiyle başlat ve interaktif moda geç
-./ribozom --interactive
-```
 
 ## 📜 Felsefe (Neden Ribozom?)
 Silikon Vadisi, zekanın ancak milyarlarca parametre ve devasa veri merkezleriyle simüle edilebileceğini savunuyor. Ribozom ise "kütüphanenin" kendisi olmayı değil, o kütüphaneyi anlayan, okuyan ve öğrenen "kütüphaneci" olmayı hedefleyen, bilgisayar biliminin köklerine bir dönüş denemesidir.
