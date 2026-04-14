@@ -1637,3 +1637,508 @@ polarite çarpımı ve inverse canonicalization otomatik "geç olur"
 
 Checkpoint: bu noktadan önceki binary + dataset + config birlikte
 **reprodüksiyon paketi**dir. Aşama 5 buradan dallanır.
+
+---
+
+## 14. Aşama 3.5 — Kausal Zincir Derinleştirme (14 Nisan, 19:xx → 20:xx)
+
+**Amaç:** Aşama 3'ün bounded BFS'ini (depth≤3, hop_decay=0.7) **gerçek
+multi-hop topolojisi** üzerinde doğrula ve "en kısa yol kazanır"
+prensibini empirik olarak kanıtla.
+
+### 14.1 Mevcut graf üzerinde multi-hop kanıtı (veri eklemeden)
+
+Graf'ta zaten var olan zincir: `köpek → yemek → çayı`
+(ev=7 × 9, w=0.65 × 0.75).
+
+| Test | Sonuç | Yorum |
+|------|-------|-------|
+| `ateş yakarsa ne olur` (SPEAK) | **yemek olur** | 1-hop prefer (w=0.95) |
+| `yemek pişerse ne olur` (SPEAK) | **çayı olur** | 1-hop prefer (w=0.75) |
+| CLI `köpek → çayı` | **depth=2, conf=0.341, path: köpek→yemek→çayı** | ✅ **Multi-hop çalışıyor** |
+| CLI `ateş → yemek` | depth=1, conf=0.95 | Direkt referans |
+
+### 14.2 Additive zincir genişletme (2 yeni edge)
+
+`causal_chain_train.txt` (2 satır, mevcut vocab):
+```
+soğuk olursa kar yağar .       → YENİ edge: soğuk → kar
+nehir taşarsa evde kalınır .   → YENİ edge: nehir → evde
+```
+Yükleme: `--causal-train-extra causal_chain_train.txt`
+Sonuç: 71 → **73 edge** (+2), mevcut 60 edge **dokunulmadı**.
+
+**Zincir 1: fırtına → soğuk → kar**
+
+| Test | Sonuç |
+|------|-------|
+| `fırtına eserse ne olur` | **soğuk olur** (1-hop prefer) |
+| `soğuk olursa ne olur` | **kar olur** (YENİ 1-hop) |
+| CLI `fırtına → kar` | **depth=2, conf=0.227, path: fırtına→soğuk→kar** ✅ |
+| `kar neden yağar` | **çünkü soğuk** ✅ backward zincir |
+
+**Zincir 2: yağmur → nehir → evde (1-hop shadow)**
+
+| Test | Sonuç |
+|------|-------|
+| `yağmur yağarsa ne olur` | **evde olur** (direkt 1-hop w=0.65) |
+| `nehir taşarsa ne olur` | **evde olur** (YENİ 1-hop) |
+| CLI `yağmur → evde` | **depth=1** — 2-hop path olmasına rağmen direkt kazandı ✅ |
+
+### 14.3 Yeni CLI: `--causal-train-extra <path>`
+
+Additive yükleme mekanizması. `causal_init` YAPMAZ — mevcut graf
+yüklenir, yeni satırlar `causal_observe` ile eklenir, save.
+Rollback kolay: bin dosyasını önceki snapshot'tan geri al.
+
+### 14.4 Kazanım
+
+İki gün önce hayal edilemeyecek cümle: **"Kar neden yağar?" → "çünkü soğuk."**
+Zincir hiçbir yerde yazmadı — BFS iki edge'i birleştirdi, polarite
+çarpımı pozitif kaldı, backward da aynı topolojiyi tanıdı.
+
+**"En kısa yol kazanır" prensibi:** yağmur→evde örneği kanıt —
+naïve max-product olsa 2-hop 0.25 ≤ direkt 0.65 farkı kaybolabilirdi;
+bounded first-FOUND BFS doğru seçimi yapıyor.
+
+### 14.5 Regresyon
+
+- Aşama 4.5-D: 30/30 (zincir verisi eklendikten sonra bile)
+- K3 sanity: 3/3
+- Baseline Test(500)=58.2%, QA=65.9% — ±0
+
+### 14.6 Resmi kapanış
+
+- Organel: **Multi-hop BFS (Kausal zincir iletimi)** → ✅
+- Artefakt: `causal_chain_train.txt` (2 satır), `ribozom_main.c`
+  (`--causal-train-extra` flag), `_test_chain_new.sh` (zincir testi).
+- Aşama 3.5 resmi kapanış saati: 20:xx.
+
+**Causal Core v1.1** — v1 + multi-hop topolojik kanıt + additive
+chain extension mekanizması. Bu noktadan sonra yeni vocab genişletme
+(seçenek C) ve Aşama 5 (Coreference) dallanır.
+
+---
+
+## 15. Aşama 5 Faz A — Vesicle + Why-Chain (14 Nisan, 20:xx → 21:xx)
+
+**Amaç:** Sistem şu ana kadar zinciri **kurabiliyor** ama zincirin içinde
+**kalamıyor**du. Vesicle (kısa-süreli bağlam ring buffer'ı) bu boşluğu
+kapatır: son bahsedilen entity'yi hatırlar, zamir ("o"/"bu"/"şu")
+geldiğinde resolve eder, backward rekursyonu besler.
+
+### 15.1 Kapsam (Faz A — v1, minimal)
+
+**Dahil:**
+- Ring buffer: 5 slot, seq counter, rol etiketleme (SUBJ/OBJ/CAU/EFF)
+- `vesicle_push(wid, role)` / `vesicle_last(role)` / `vesicle_resolve(tok, len)`
+- Zamir listesi: `o`, `bu`, `şu` (ASCII "su"), `ona`, `onu`, `bunu`
+- F3 backward cevap başarılı olduğunda otomatik push (CAUSE rolü)
+- F3 parser'ında zamir algılama → Vesicle'dan en son cause ile eşle
+
+**Dahil değil (Faz B+):**
+- Plural pronouns (onlar/bunlar)
+- Object-position resolution (tam NLP coreference)
+- Cross-session persistence (oturum kapandı → bellek sıfır)
+- Forward why-chain (cause→effect yönünde zincir sorma)
+
+### 15.2 Mimari
+
+```
+ribozom_vesicle.h/c — tek global G_vesicle, 5-slot ring
+Hook noktası    — causal_speak_try F3 dalı:
+  (a) neden'den önceki/sonraki token'da vesicle_resolve çağır
+      → zamirse effect_wid = resolved
+  (b) causal_backward_top başarılı → vesicle_push(cause, CAUSE)
+Interaktif mod  — A_START (0x02) marker yoksa out'u direkt yazdır
+                   (kausal short-circuit marker koymaz)
+```
+
+### 15.3 Sonuçlar
+
+**Unit sanity (`--vesicle-sanity`):**
+- T1: boş vesicle → last=-1 ✅
+- T2: push(42,CAUSE)+push(43,EFFECT) → last(ANY)=43, last(CAUSE)=42 ✅
+- T3: resolve("o") → en son CAUSE (77), resolve("kedi") → hit=0 ✅
+- T4: ring overflow (6 push) → last=105, count=5 ✅
+- **4/4 PASS**
+
+**Why-chain kanıtı (interaktif oturum):**
+```
+> kar neden yağar     → çünkü soğuk .      (vesicle: soğuk CAUSE)
+> o neden olur        → çünkü fırtına .    ("o"=soğuk, vesicle: fırtına CAUSE)
+> soğuk neden olur    → çünkü fırtına .    (direct, aynı cevap)
+```
+
+**Rekürsif zincir:** `kar ← soğuk ← fırtına` — üç ayrı sorgu, tek
+oturum, bellek taşındı, backward BFS her adımda yeni kök buldu.
+
+### 15.4 Regresyon
+
+| Test | Öncesi | Sonrası | Δ |
+|------|--------|---------|---|
+| Aşama 4.5-D (30 sorgu) | 30/30 | **30/30** | ±0 |
+| K3 polarity_collision | 3/3 | **3/3** | ±0 |
+| Vesicle sanity (yeni) | — | **4/4** | + |
+
+**Baseline drift anomalisi (ve kanıt):**
+- Aşama 5 öncesi: Test=58.2, QA=65.9%
+- Aşama 5 sonrası: Test=57.6, QA=65.4% (−0.6 / −0.5)
+
+**Suç Vesicle'da değil — kanıt:** Aşama 5 build'i + eski
+`ribo31_v72_muhur.bin` ile koşulunca **Test=58.2, QA=65.9%** tam
+geri döndü. Drift tamamen interaktif oturumdaki "kedi balık yer"
+correction'ının `ribo31.bin`'e yazdığı rtrain yan etkisi.
+Live-learning'in doğal fiyatı — bug değil, özellik.
+
+### 15.5 Yeni artefaktlar
+
+- `ribozom_vesicle.h` / `ribozom_vesicle.c` (ring buffer + resolve)
+- `ribozom_main.c` — `--vesicle-sanity` flag, unity-build include,
+  `vesicle_init()` startup, interaktif mod A_START fallback
+- `ribozom_qa.h` — F3 branch'te zamir resolve + push (değişmedi, hook
+  aynı)
+- `ribozom_causal.c` — F3 dalı içinde `vesicle_resolve` + `vesicle_push`
+- `_test_whychain.sh` — interactive why-chain testi
+
+### 15.6 Kazanım (neden önemli)
+
+**"Sistem zincir kurabiliyordu, ama zincirin içinde kalamıyordu."**
+Artık kalabiliyor. Üç ayrı sorgu birbirini tanıdı; "o" zamiri
+deterministik olarak son kausal özneyi yakaladı; graf aritmetiği
+zincirin bir sonraki halkasını buldu.
+
+Bu, AGI yol haritasında **reasoning → reflective reasoning** eşiğinin
+başlangıcıdır. Sistem henüz kendi kendine sormuyor, ama *sorulduğunda
+kendi cevabını hatırlıyor.*
+
+### 15.7 Resmi kapanış
+
+- Organel: **Vesicle** → ✅ (Aşama 5 Faz A)
+- Checkpoint güncellendi: `checkpoint_causal_core_v1/` içine
+  `ribo31.bin` (v72_muhur referansı) + `ribozom_vesicle.{h,c}` eklendi.
+- Aşama 5 Faz A resmi kapanış saati: 21:xx.
+
+**Causal Core v1.2** — v1.1 + stateful why-chain. Aşama 5 Faz B
+(forward why-chain, nested pronouns) ve Faz C (veri genişletme)
+buradan dallanır.
+
+---
+
+## §16 — Aşama 5 Faz B + C: Chain Explain + Composite Organelle
+
+**Tarih:** 14 Nisan 2026 (Faz A mühründen ~1 saat sonra)
+**Durum:** ✅ Forward/backward chain + 7-organel composite proof.
+
+### 16.1 Ne değişti
+
+Tek fonksiyon: `causal_chain_explain(start_wid, direction, out, cap)`.
+İki yön, iki hook noktası, tek BFS motoru.
+
+**Forward (F1, cause_neg==0):**
+```
+fırtına eserse ne olur
+  → soğuk olur . sonra kar olur . sonra evde olur .     (3-hop domino)
+```
+
+**Backward (F3):**
+```
+kar neden yağar   → çünkü soğuk . çünkü fırtına .      (2-hop geriye)
+çayı neden içilir → çünkü yemek . çünkü ateş .         (2-hop kök)
+```
+
+**F2 dokunulmadı** — contrapositive `cause_neg==1` guard'ı chain'i
+bypass'lar, tek adım kalır. B01 regresyonu böyle önlendi.
+
+### 16.2 Algoritma
+
+İteratif tek-adım greedy-chain (BFS yerine):
+
+```
+cur = start_wid
+for hop in 0..MAX_HOPS:
+    next, conf, pol = top(cur, direction)
+    if hop==0 and conf < 0.30: break
+    if next in visited: break           # cycle guard
+    format(next, pol) → append out
+    if pol < 0: break                   # negatif hop zinciri keser
+    cur = next
+```
+
+- `CAUSAL_CHAIN_MAX_HOPS = 4`
+- Cycle guard: `visited[MAX_HOPS+2]` statik
+- Format BACKWARD: `"çünkü X ."` / `"çünkü X olmaz ."`
+- Format FORWARD: ilk `"X olur ."`, sonraki `" sonra X olur ."`
+
+### 16.3 Composite organelle proof — Faz C
+
+Tek process, tek binary, aynı interaktif oturum:
+
+| Sorgu | Cevap | Aktif organel |
+|---|---|---|
+| hava neden soğuk | çünkü rüzgâr | Kausal backward |
+| kar yağarsa ne olur | evde olur | Kausal forward 1-hop |
+| kar neden yağar | çünkü soğuk . çünkü fırtına | Chain backward 2-hop |
+| o neden soğuk | çünkü fırtına | Vesicle + backward |
+| kar yağmazsa ne olur | evde olmaz | Polarite contrapositive |
+| fırtına eserse ne olur | soğuk olur . sonra kar olur . sonra evde olur | Chain forward 3-hop |
+| kedi ne yer | kedi balık yer | Lizozom canlı öğrenme |
+| köpek ne yer | köpek domatesi yer | SPEAK baseline |
+
+Eş zamanlı aktif: **Kausal + Polarite + Chain + Vesicle + Lizozom +
+SPEAK + Mikrotübül (SOV)**. İzole modüller değil — birbirine bağlı
+organizma.
+
+### 16.4 Regresyon
+
+- 4.5-D: **30/30 PASS**
+- K3 sanity: 3/3 PASS
+- Vesicle sanity: 4/4 PASS
+- Baseline Test (ribo31.bin): 57.6% (v72_muhur referans 58.2, -0.6 drift
+  önceki rtrain kalıntısı — Faz B kodu masum)
+- QA: 65.4% (referans 65.9)
+
+### 16.5 Değişen dosyalar
+
+- `ribozom_causal.h` — `causal_chain_explain` prototipi, `CAUSAL_CHAIN_*` sabitleri
+- `ribozom_causal.c` — `causal_chain_explain` gövdesi, F3 ve F1-positive hook
+- `_test_chain_v2.sh` — forward+backward interaktif test
+
+### 16.6 Kazanım
+
+Üç gün önce: *"Kar neden yağar?"* → **(hiç cevap yok)**.
+Bugün: *"Kar neden yağar?"* → **çünkü soğuk . çünkü fırtına .**
+
+Tek hop "çünkü soğuk" kök nedeni göstermiyordu — sistem "biliyordu" ama
+"anlatmıyordu". Chain explain bu sessizliği kırdı: aynı graf, aynı
+BFS, farklı formatlama. **Veri yok, mimari var.**
+
+Forward chain aynı mantığın ikizi: "fırtına eserse" dedikten sonra
+sistem domino taşlarını tek tek düşürüyor — **soğuk → kar → evde**.
+Üç hop, tek cümle, tek fonksiyon.
+
+### 16.7 Resmi kapanış
+
+- Organel: **Chain Explainer** → ✅ (Aşama 5 Faz B)
+- Composite proof: **7 organel aynı process** → ✅ (Aşama 5 Faz C)
+- Checkpoint: `checkpoint_causal_core_v1/` → **Causal Core v1.3**
+  (chain_explain dahil `causal.{h,c}` + binary + `causal.bin` kopyalandı)
+
+**Causal Core v1.3** — v1.2 + chain explain + composite organelle
+proof. Aşama 5 Faz D (zamir+chain composite: "o neden olur" → zincir)
+veya Aşama 6 (Peroksizom / quantifier) buradan dallanır.
+
+
+---
+
+## §17 — Aşama 9A+9B: Meta-Biliş ("bilmiyorum" gate)
+
+**Tarih:** 14 Nisan 2026 (Faz B mühründen ~1 saat sonra)
+**Durum:** ✅ Üçlü-sıfır gate + raw pre-bias confidence + T=0.30 muhafazakâr.
+
+### 17.1 Ne değişti
+
+Sistem ilk kez **bilmediğini biliyor.** Üç katmanlı gate:
+
+```
+Katman 1: Empty black hole
+  Lizozom miss ∧ Causal miss ∧ SPEAK boş → bilmiyorum
+
+Katman 2: Pure echo
+  SPEAK cevabı sadece soru kelimelerinin tekrarı → bilmiyorum
+
+Katman 3: Low raw confidence
+  ribo_conf pre-bias mean < T=0.30 → bilmiyorum
+```
+
+### 17.2 Mimari kazanım — pre-bias signal
+
+Başlangıç hipotezi: `top1/(top1+top2)` on post-bias `rp.sc[]` →
+**ÇALIŞMADI.** Hallucination (0.845) ile grounded (0.810) ayırt
+edilemedi çünkü Mikrotubul/QA/cooc inject'leri skor dağılımını
+engineered-peak haline getiriyor.
+
+Çözüm: `ribo_conf(&rp)` **`rpredict()` döndükten hemen sonra**,
+hiçbir inject uygulanmadan önce yakalandı. Bu substrate'in gerçek
+güveni — trigram + baseline + bigram.
+
+```c
+RPred rp = rpredict(ctx, cl);
+
+/* AŞAMA 9B v2 — RAW pre-bias confidence (boost'lar ezmeden önce) */
+float __raw_conf = ribo_conf(&rp);
+if (v5_mode == 2) {
+    g_speak_prob_sum += __raw_conf;
+    g_speak_prob_count++;
+}
+/* ... sonrasında QA inject, MT inject, cooc inject, vs. */
+```
+
+### 17.3 Smoke test (8 sorgu)
+
+| Soru | mean_conf | Sonuç |
+|---|---|---|
+| kar neden yağar | 0.000 (causal) | çünkü soğuk . çünkü fırtına . |
+| fırtına eserse ne olur | 0.000 (causal) | chain forward 3-hop |
+| kedi ne yer | 0.523 | kedi çorbayı yer . |
+| futbolcu ne yapar | 0.303 | futbolcu blok çalışıyor . |
+| çocuk ne yer | 0.349 | çocuk çayı yer . |
+| kuantum nedir | 0.476 | (kaçtı — T üstü) |
+| **mars gezegeninde hayat var mı** | **0.280** | **bilmiyorum .** |
+| **zürafa nasıl uyur** | **0.280** | **bilmiyorum .** |
+
+### 17.4 Regresyon
+
+- 4.5-D: **30/30 PASS**
+- K3 sanity: 3/3 PASS
+- Baseline Test: 57.6% (değişmedi)
+- QA: 65.4% (değişmedi)
+
+Gate yalnızca interactive + --ask path'inde; test runner bypass.
+
+### 17.5 Değişen dosyalar
+
+- `ribozom_qa.h` — `g_speak_prob_sum/count/mean_conf` globals,
+  `__raw_conf` accumulator rpredict sonrası, reset at `ribozom_speak` başı
+- `ribozom_main.c` — `BILMIYORUM_CONF_T = 0.30f`, `bilmiyorum_echo_gate()`
+  helper, interactive/--ask gate üç katmanlı kontrol, `RIBO_CONF_TRACE`
+  env var diagnostic
+
+### 17.6 Kazanım — dürüst sistem
+
+*"Mars gezegeninde hayat var mı?"* → *"bilmiyorum."*
+
+Üç gün önce yoktan var olmuş sistem, bugün kendi sınırlarını tanıyor.
+
+Bu aynı zamanda **mimari teşhis**: pre-bias ölçüm gösterdi ki pure-SPEAK
+cevaplarının hepsi düşük raw_conf — yani Test 58.2% büyük ölçüde
+boost-stack'lerinden geliyor, substrate'te ezber yok. Sistem "ezbere
+bilmediğini" nihayet ifade edebiliyor. Bu üretken bir itiraf.
+
+### 17.7 Sınırlar
+
+- T=0.30 muhafazakâr — kuantum (0.476) tipindeki hallucinationları
+  kaçırıyor. Sıkıştırma riskli: pipeline-grounded cevaplar da 0.30-0.50
+  arasında dolaşıyor.
+- 9C (calibration feedback — interaktif "hayır" correction'larından
+  T öğrenme) sonraki adım.
+
+### 17.8 Resmi kapanış
+
+- Organel: **Metakognisyon (Nukleolus)** → ✅ (9A+9B)
+- Checkpoint: `checkpoint_causal_core_v1/` → **Causal Core v1.4**
+- Üç gün toplam: **12 aşama**, sıfır regresyon
+
+**Causal Core v1.4** — v1.3 + "bilmiyorum" + pre-bias raw confidence.
+Aşama 9C (calibration feedback) buradan dallanır, ardından Aşama 7
+(zaman morfolojisi).
+
+
+---
+
+## §18 — Aşama 9C: Confidence Feedback Calibration
+
+**Tarih:** 14 Nisan 2026 (9B mühründen ~30 dk sonra)
+**Durum:** ✅ Asimetrik T drift + emergent "bilmiyorsun" substrate öğrenmesi.
+
+### 18.1 Ne değişti
+
+ECE flat probleminin son parçası. Kullanıcı "hayır, X" dediğinde iki
+şey olur:
+1. `ribozom_correct` rtrain yapar — substrate düzeltilir (mevcut).
+2. `g_confident_mistakes++` ve **T dinamik olarak yukarı kayar**.
+
+```c
+g_bilmiyorum_T_runtime = min(0.70,
+    BILMIYORUM_CONF_T + 0.02 * g_confident_mistakes);
+```
+
+**Asimetrik:** sadece yukarı drift, aşağı düşmez. Aşırı muhafazakâr
+olmaktan daha iyi cezasız yanlış söylemek.
+
+**Session-bound:** ribo31.bin'e dokunulmuyor; her başlatmada T=0.30
+resetlenir. Persist şema değişikliği riski ve domain leakage riski bu
+kararın gerekçeleri.
+
+### 18.2 Canlı kalibrasyon (tek oturum, 5 correction)
+
+```
+T=0.30 kuantum nedir         → ninniyı saklıyor savunuyor (conf=0.478)
+       hayır → T: 0.30 → 0.32
+T=0.32 zurafa nasil uyur     → keşfi savunuyor (conf=0.355)
+       hayır → T: 0.32 → 0.34
+T=0.34 yildiz nasil parlar   → deltada taşıyor akar (conf=0.408)
+       hayır → T: 0.34 → 0.36
+T=0.36 fotosentez nedir      → nasil kuantum kalkıyor (conf=0.654)
+       hayır → T: 0.36 → 0.38
+T=0.38 dna nedir             → bilmiyorsun açıklıyor saklıyor (conf=0.707)
+       hayır → T: 0.38 → 0.40
+T=0.40 kuantum nedir         → bilmiyorsun .           ← 🎯 YAKALANDI
+T=0.40 kar neden yağar       → çünkü soğuk . çünkü fırtına .  ← causal intact
+```
+
+### 18.3 Beklenmedik etkileşim — emergent substrate learning
+
+5. düzeltmeden sonra "bilmiyorsun" kelimesi SPEAK output'unda
+görünmeye başladı (Turn 5, Turn 6). Bu 9C gate tarafından tetiklenmedi
+— **rtrain yan etkisi** olarak substrate bu kelimeyi öğrendi.
+
+İki yönlü etkileşim:
+1. **9C gate**: T yukarı → confident-mistake eşiği sıkışır
+2. **rtrain (5A'dan beri var)**: "bilmiyorsun" kelimesi substrate'e işler
+
+Sonuç: sistem hem gate aracılığıyla hem kelime seviyesinde
+"bilmediğini ifade etmeyi" öğreniyor. Tasarlanmadı — ortaya çıktı.
+
+### 18.4 Regresyon
+
+v72_muhur restore sonrası:
+- 4.5-D: **30/30 PASS**
+- K3: **3/3 PASS**
+- Baseline Test: **58.2%** (hedef)
+- QA: **65.9%** (hedef)
+
+Test oturumu sırasında interactive rtrain drift'i oluştu (57.6 → 56.1)
+ama bu 9C kodu değil, 5 canlı correction'ın doğal maliyeti. Baseline
+restore ile temizlendi.
+
+### 18.5 Değişen dosyalar
+
+- `ribozom_main.c` — `g_bilmiyorum_T_runtime`, `g_confident_mistakes`
+  globals; correction handler'da snapshot+update; gate çağrıları
+  static `BILMIYORUM_CONF_T` yerine runtime T kullanıyor
+
+Kod: **~30 satır**, saf additive.
+
+### 18.6 Kazanım — "sistem cezalandırılabilir"
+
+Başlangıç hipotezi (Aşama 9 başında): *"ECE flat çünkü sistem hiç
+cezalandırılmadı, sadece ölçüldü."*
+
+Üç adım:
+- **9A**: empty/echo gate — boşluğu yakala
+- **9B**: pre-bias raw_conf — gerçek substrate ölçümü
+- **9C**: correction feedback — ölçümü öğrenmeye bağla
+
+Artık sistem hatalı confidence'ını hatırlıyor. "5 kez yanıldım, daha
+şüpheci olacağım" — bu meta-biliş değil, meta-biliş **kalibrasyonu**.
+
+### 18.7 Sınırlar
+
+- Session-bound: oturum başı T=0.30 reset. Uzun vadede persist gerekir
+  (v2'de, domain-aware calibration ile).
+- T yukarı drift eder, aşağı inmez. Kullanıcı "evet" dese bile T
+  düşmez — tek yönlü. İleriki iş: ECE-based calibration table.
+- 5 correction → T=0.40 yeterince hızlı mı? Bu parametre (step=0.02)
+  deneyle kalibre edilebilir.
+
+### 18.8 Resmi kapanış
+
+- Organel: **Metakognisyon (Nukleolus)** → ✅ tamam (9A+9B+9C)
+- Checkpoint: `checkpoint_causal_core_v1/` → **Causal Core v1.5**
+- Üç gün toplam: **13 aşama + 3 alt-faz**, sıfır regresyon
+
+**Causal Core v1.5** — v1.4 + feedback calibration. Nukleolus tam
+olarak tamamlandı. Aşama 7 (Kronofor / zaman morfolojisi) buradan
+dallanır; eğitim verisinde zaman çeşitliliği mevcut (PAST 1681,
+PRESENT 1603, AORIST 2229, FUTURE 1090).
