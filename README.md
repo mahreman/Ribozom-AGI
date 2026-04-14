@@ -365,7 +365,8 @@ tamamen bypass eder.
 8. ~~Domain genelleme testi~~ ✅ Tamamlandı — 22 kategori, 7 domain ayrışması görüldü
 9. ~~v7.0 Domain bleeding fix~~ ✅ Co-occurrence context boost
 10. ~~v7.1 SOV word order fix~~ ✅ Subject injection + position-aware Protein Folding
-11. **Nesne/fiil seçimi iyileştirmesi** — v7.1 stabilize edildi, sırada
+11. ~~v7.2 Nesne/fiil seçimi~~ ✅ Object Word Injection + 5 kritik bug fix ("kartal eti yer")
+12. **Aşama 2 — Koşullu Cümleler** 🔄 Mini sanity ✅ (-sa/-se ayrı kategori), full eğitim devam
 
 ### Kısa Vade ⏳
 12. **"Bilmiyorum" eşiği** — ribo_conf() düşükse "bilmiyorum" de
@@ -779,3 +780,103 @@ Aşama 3 ise Vesicle Memory gibi yeni bir organelle gerektiriyor — cümle-aras
 Bu noktada mimari sıçrama kaçınılmaz ama altyapı (Lizozom, Mikrotübül) temel sağlıyor.
 
 > *"Doğru sıra: önce yürü, sonra koş, sonra uç. Ama yürürken uçuş planını çizmeye başla."*
+
+---
+
+## 8. Aşama 2 — Koşullu Cümleler (14 Nisan, Devam Eden)
+
+### 8.1 Strateji Kararı
+v7.2 tamamlandıktan sonra iki yol vardı: (a) cross-domain leak + fiil seçimi
+optimizasyonu (%62.5 → ~%75 SPEAK kalitesi), (b) Aşama 2'ye atlayış.
+Karar: **Aşama 2**. Gerekçe — SPEAK optimizasyonu diminishing returns, Aşama 2
+yeni bir bilişsel boyut (koşul operatörü) ekliyor. Aynı efor, daha büyük sıçrama.
+
+### 8.2 Veri
+- `train_data_15k_pre_s2.txt` — v7.2 mühürlü baseline (13600 satır, 4943 QA pair)
+- `conditional_train.txt` — 2000 koşullu cümle, 850 QA pair
+- `train_data_15k.txt` — birleşik 15600 satır, 5793 QA pair (eğitim girdisi)
+- Not: `ribozom_main.c` dosya adını hardcoded okuyor — `--train <path>` desteklenmiyor.
+  Veri değişikliği için dosyayı yerinde değiştir + backup al protokolü kullanıldı.
+
+### 8.3 Mini Sanity (1500 satır, 14 Nisan sabah)
+5 dk hızlı test — full eğitime girmeden sinyal doğrulama.
+Dataset: 500 koşullu + 1000 normal (shuf), 606 QA pair.
+
+**Sonuç — Senaryo A (Başarı):**
+```
+CAT_14 (cohesion 0.94):  sorarsa, çalışırsa, yağarsa, çalarsa, ararsa, isterse, ...+26
+CAT_21 (cohesion 1.00):  geçerse, düşerse, korkarsa, sevinirse
+CAT_27 (cohesion 0.53):  pişer, demlenir, nedir, spor, ver, uyanır        (OUTCOME fiilleri)
+```
+
+**Gözlemler:**
+- `-sa/-se` eki **ayrı kategori** oluşturdu, cohesion tavan (0.94 ve 1.00)
+- **İki** koşul cluster'ı çıktı — muhtemelen aspect/tense ayrımı
+  (alışkanlık-koşulu vs olay-koşulu hipotezi)
+- CAT_27'de `-er/-ir` aorist outcome fiilleri toplandı → koşul→sonuç **ikili yapısı**
+  representation seviyesinde belirmiş
+
+**Kritik ayrım:** Bu sadece **representation** sinyali. Asıl test SPEAK'te
+"condition usage" — sistem bu bilgiyi karar verirken kullanıyor mu?
+
+### 8.4 Test Protokolü (Full Eğitim Sonrası)
+
+**A. Cluster analizi:**
+1. CAT_14 ve CAT_21 tam liste çıkar
+2. **Altın test** — `çalışırsa` vs `çalışsaydı` aynı cluster'da mı?
+   - Aynı → sistem sadece `-sa` ekine bakıyor
+   - Farklı → sistem **aspect/tense** ayrıştırıyor
+
+**B. Distribution probing (3-yönlü delta):**
+```
+P(w | "kedi ne yapar?")           → baseline
+P(w | "kedi açsa ne yapar?")      → condition+
+P(w | "kedi tokken ne yapar?")    → condition-
+```
+Değerlendirme:
+- Üç dağılım da aynı → koşul **tamamen pasif** (Senaryo B)
+- Koşullu ≠ baseline ama iki koşul birbirine benziyor → koşul "fark ediliyor" ama polarite okunmuyor
+- İki koşul **zıt** → gerçek condition usage ✔
+
+**C. Negation + condition:**
+- `yağmur yağarsa` vs `yağmur yağmazsa` delta
+- Zıt dağılım = polarite + koşul **birlikte** işliyor (çift büyük sıçrama)
+
+**D. SPEAK direkt test:**
+- `kar yağarsa ne olur?`
+- `kedi açsa ne yapar?` vs `kedi tokken ne yapar?`
+- `çocuk okula gitmezse ne olur?`
+- `kedi aç değilse ne yapar?`
+
+### 8.5 Teşhis Matrisi
+
+| Cluster | Distribution | Teşhis | Aksiyon |
+|---------|--------------|--------|---------|
+| ✔ | ✔ | Gerçek condition learning | Aşama 2 zaferi, Aşama 3 planlama |
+| ✔ | ❌ | Representation var, usage yok | Condition-weight injection (Ek-8) |
+| ❌ | ❌ | Kapasite sınırı | Mimari genişletme gerekli |
+| ❌ | ✔ | İmplicit öğrenme | Derinlemesine çalış, çok ilginç |
+
+### 8.6 Açık Mimari Risk — WPOS Bucket Çakışması
+Mevcut sistem varsayımı: `[özne] [nesne] [fiil]` — wpos bucket-4 son/ana fiil.
+Koşullu yapı: `[özne] [koşul-fiil] [nesne] [ana-fiil]` — **iki fiil**.
+
+Eğer koşul fiilleri (`açsa`, `yağarsa`) bucket-3 veya bucket-4'e düşüp ana fiille
+çakışırsa Protein Folding patolojisi yaşanır. Full eğitim sonrası wpos dağılımı
+inceleme zorunlu. Çözüm adayı (gerekirse): bucket genişletme (4→5) veya ayrı
+"condition bucket" tanımı.
+
+### 8.7 Full Eğitim Durumu
+- Başlangıç: 14 Nisan sabah (~08:00)
+- Task: arka plan, PID üzerinden izleniyor
+- Tahmini süre: 1.5–2 saat (mini'de Faz 1 7 dk / 1500 satır → 15600'de ~70 dk sadece Faz 1)
+- Çıktı: `s2_full.log`, `ribo31.bin` (yeni), `ribo31_v72_muhur.bin` yedek korunuyor
+
+### 8.8 Beklenen Teorik Sıçrama
+- **Önce:** kelime → kategori (ezber + şablon)
+- **Şimdi:** kategori → fonksiyon (`-sa` = operatör)
+- **Asıl test:** sistem bu operatörü **karar verirken** kullanabilecek mi?
+- Bu noktadan sonra: ML → reasoning geçişi (proto-logic seviyesi)
+
+> *"Sistem 'eğer' kelimesinin ne olduğunu anladı — şimdi 'eğer'in sonucu nasıl
+> değiştirdiğini öğrenip öğrenmediğini test edeceğiz."*
