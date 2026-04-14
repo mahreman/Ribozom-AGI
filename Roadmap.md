@@ -18,6 +18,7 @@
 0. [Tasarım İlkeleri (değişmez)](#0-tasarım-i̇lkeleri)
 1. [Aşama 1 — SOV Temelleri ✅](#aşama-1)
 2. [Aşama 2 — Koşul Operatörü 🔄](#aşama-2)
+2. [Aşama 2.5 — Güven Altyapısı (Substrate)](#aşama-2-5)
 3. [Aşama 3 — Nedensellik](#aşama-3)
 4. [Aşama 4 — Olumsuzluk ve Polarite](#aşama-4)
 5. [Aşama 5 — Coreference ve Kısa-Süreli Bellek](#aşama-5)
@@ -25,7 +26,7 @@
 7. [Aşama 7 — Zaman](#aşama-7)
 8. [Aşama 8 — Mekansal İlişki](#aşama-8)
 9. [Aşama 9 — Meta-Biliş ve Güven](#aşama-9)
-10. [Aşama 10 — Üretken Akıl Yürütme](#aşama-10)
+10. [Aşama 10-A — Pasif Hipotez Üretimi (İnsan Onaylı)](#aşama-10-a) · [Aşama 10-B — Otonom Üretim (AGI Sonrası)](#aşama-10-b)
 11. [Aşama 11 — Öz-Gözetim](#aşama-11)
 12. [Aşama 12 — Multi-Turn Diyalog](#aşama-12)
 13. [Aşama 13 — Soyut Kavram](#aşama-13)
@@ -53,6 +54,20 @@ proje bozulmuş demektir.
 ### 0.2 Sıfır Kütüphane
 `stdio.h`, `stdlib.h`, `string.h`, `math.h`, `time.h` — **bu kadar**. Vektör veritabanı yok,
 JSON parser yok, regex yok, protobuf yok. Bellek `malloc`, dosya `fread`, hesap `pow/exp/log`.
+
+**Test edilmiş cazibe (14 Nisan sohbeti):** Projede `esim()` (kosinüs benzerliği)
+O(N²) işi, NW=20K'ya ulaştığında saatlerce sürecek. Geçmiş tasarım tartışmasında
+"OpenCL ile GPU'da 1 saniye vs CPU'da 1 saat" fırsatı gündeme geldi. **Karar:
+ilke korundu.** Alternatif CPU-only çözümler mevcut (Yol A):
+- **LSH (Locality-Sensitive Hashing)** — O(N²) → O(N log N), ~200 satır saf C, 50-100x
+- **Sampled esim** — k rastgele çift, ranking için yeterli
+- **Tiered esim** — kategori-içi full, kategori-arası sampled (doğal locality)
+- **Incremental esim** — yeni kelimeler için hesapla, eski cache'den
+
+Bu alternatifler metafor bütünlüğünü de koruyor: nöron synapse'larını tam
+aramaz, approximate yakınlık kullanır — LSH biyolojik olarak da daha doğru.
+Kütüphane eklemek "sıfır kütüphane" markasını geri dönüşsüz kaybettirir;
+ilke istisna kaldırmaz.
 
 ### 0.3 Deterministik ve Tek Süreç
 Thread yok, async yok, rastgelelik seeded. Bir girdi → aynı çıktı. Değilse hata vardır.
@@ -179,10 +194,149 @@ kar yağarsa okullar tatil olur .
 \x01 hava soğursa ne giyeriz ? \x02 kalın ceket .
 ```
 
-### Aşama 2'den Aşama 3'e geçiş sinyali
-- Cluster ✔ + Distribution ✔ → Aşama 3'e direkt geç
-- Cluster ✔ + Distribution ❌ → Condition Layer entegrasyonu sonrası Aşama 3
+### Aşama 2'den Aşama 2.5'e geçiş sinyali
+- Cluster ✔ + Distribution ✔ → Aşama 2.5'e geç (altyapı), sonra Aşama 3
+- Cluster ✔ + Distribution ❌ → Condition Layer entegrasyonu sonrası Aşama 2.5
 - Cluster ❌ → Mimari sıçrama gerekli (bucket genişletme), sonra tekrar dene
+
+---
+
+<a name="aşama-2-5"></a>
+## Aşama 2.5 — Güven Altyapısı (Substrate, Aşama 3'ten ÖNCE Zorunlu)
+
+**Amaç:** Güveni bir **yetenek** olarak değil, **altyapı** olarak kurmak. Her sonraki
+aşamanın patolojik yüksek-güvenli hatalardan korunması için zorunlu.
+
+### Neden Aşama 9 beklenemez
+Aşama 3 (nedensellik), 4 (olumsuzluk), 5 (coreference), 6 (nicelik) — her biri
+**yanlış çıkarıma yüksek güven verme** riski taşıyor:
+- "doktor koşu yapar çünkü sağlıklı" (Aşama 3, hatalı nedensellik)
+- "taş yemez" mi "taş yer" mi olduğu belirsiz (Aşama 4, polarite boşluğu)
+- "O kim?" için ambiguous resolution (Aşama 5)
+- "bazısı" için kesin çıkarım (Aşama 6, quantifier tuzağı)
+
+Meta-biliş altyapısı **geç** gelirse, sonraki aşamalar hatalarını öğrenmiş olur —
+sonra düzeltmek çok pahalı.
+
+### Aşama 2.5 ≠ Aşama 9
+- **Aşama 2.5** = altyapı: confidence hesaplama, raporlama, calibration telemetrisi
+- **Aşama 9** = uygulama: SPEAK'te cümleye dökme ("eminim", "belki", "bilmiyorum")
+
+İkisi farklı iş. Altyapı önce, uygulama sonra.
+
+### Kurulacak bileşenler
+
+#### 2.5.1 Unified Confidence Aggregation
+Her organel kendi confidence'ını döndürmeli. Toplam confidence birleşik:
+```c
+typedef struct {
+    float pattern_conf;      /* cluster + cooc skoru */
+    float position_conf;     /* wpos uyumu */
+    float category_conf;     /* prompt_prior_qa eşleşmesi */
+    float domain_conf;       /* cross-domain leak var mı */
+    float aggregate;         /* yukarıdakilerin ağırlıklı geometrik ortalaması */
+} confidence_t;
+
+confidence_t compute_confidence(const char *query, int predicted_wid);
+```
+
+Geometrik ortalama seçiliyor çünkü bir boyut düşükse toplam da düşük olmalı
+(aritmetik ortalama zayıf halkaları saklıyor).
+
+#### 2.5.2 Absurd Detector (Erken Alarm)
+```c
+/* ribozom_absurd.h */
+int is_absurd_query(const char *query);
+/* Tetikleyiciler:
+   - Type mismatch: canlı fiili + cansız özne ("taş uyur")
+   - Cross-domain bizzat: "doktor + futbol topu"
+   - Distribution flat: hiçbir kategori baskın değil (cluster sinyali yok)
+   - Unknown word ratio > %50 */
+```
+
+Absurd tespit edilen query'lerde `aggregate` otomatik olarak 0.1 altına düşürülür —
+sistem o query üzerinde **asla** yüksek güven veremez.
+
+#### 2.5.3 Cluster-İçi Tip Çeşitliliği Ölçümü (Dirty Cluster Detector)
+**Kaynak gözlem (14 Nisan, Aşama 2 full eğitim):** CAT_21 cohesion 0.98 geldi ama
+içerik `hekimi, sahibi, insanı, kolaysa, yağarsa, yanarsa` — nesne ekli isimler +
+koşul ekli fiiller aynı cluster'da. Distributional similarity pozisyonel son-ek
+benzerliğini (`-i` ve `-sa` her ikisi de "cümle sonu ek") semantik tip ayrımıyla
+karıştırabiliyor.
+
+Cohesion tek başına yetmiyor. İkinci bir ölçüm gerekli:
+```c
+typedef struct {
+    int    cluster_id;
+    float  cohesion;              /* klasik cluster-içi uzaklık */
+    float  wpos_homogeneity;      /* YENİ: bucket-dağılım entropisi */
+    float  suffix_homogeneity;    /* YENİ: son-2-karakter çeşitliliği */
+    int    dominant_bucket;
+    float  trust;                 /* birleşik skor */
+} cluster_quality_t;
+
+float compute_wpos_homogeneity(int cluster_id) {
+    /* Bu cluster'daki kelimelerin wpos[5] dağılımlarının KL-divergence'ı
+       düşük = homojen (hepsi aynı bucket baskın) → temiz
+       yüksek = heterojen (karışık bucket'lar) → kirli */
+    ...
+}
+```
+
+Bir cluster'ın "güvenilir" sayılması için:
+- `cohesion > 0.7` **VE**
+- `wpos_homogeneity > 0.7` (bucket dağılımları benzer)
+- `suffix_homogeneity > 0.5` (son-ek çeşitliliği aşırı değil ama zorunlu aynı da değil)
+
+Sadece cohesion'a dayanan güven **artık yanıltıcı** kabul edilir. Aşama 2'deki
+CAT_21 tam bu: cohesion tavan, wpos heterojen (isim bucket + fiil bucket karışık).
+
+Bu ölçüm **her aşamada** cluster kalitesini denetler — sadece Aşama 2'nin
+semptomu değil, genel sistem sağlık göstergesi.
+
+#### 2.5.4 Calibration Telemetrisi
+```c
+/* Her batch testi sonrası */
+typedef struct {
+    float conf_bin;          /* 0.1, 0.2, ... 1.0 */
+    int predicted_count;
+    int actually_correct;
+    float ece_contribution;  /* Expected Calibration Error */
+} calibration_bin_t;
+
+calibration_bin_t cal_bins[10];
+float compute_ece(void);  /* < 0.1 hedefi */
+```
+
+Sistem `conf=0.9` dediği sorularda gerçekten %90 doğru mu? Yoksa %60 mı (overconfident)?
+Bu telemetri her aşamada ölçülür ve ECE > 0.15 olursa **o aşama geçememiş** sayılır.
+
+### Test protokolü
+1. **Absurd test seti** (10-20 cümle): sistem hepsine `conf < 0.2` vermeli
+   - "taş uyur", "kedi okula gitti", "5 yatar"
+2. **High-confidence test** (bilinen): sistem `conf > 0.7` vermeli
+   - "kedi balık yer", "kuş uçar"
+3. **ECE hesabı**: `|conf - accuracy|` tüm bin'lerde **ortalama** < 0.1 olmalı
+4. **Calibration grafiği** (manuel göz kontrolü): y=x çizgisine yakın mı?
+
+### Failure modları
+
+| Failure | Belirti | Çözüm |
+|---------|---------|-------|
+| Overconfident | Her şeye conf > 0.8 | Temperature parametresi (softmax smoothing) |
+| Underconfident | Her şeye conf < 0.4 | Eşikleri empirik yeniden kalibre |
+| Absurd detector false positive | Sağlam query'lere de düşük conf | Detector kuralları gevşet, ECE ile dengeyi ölç |
+| Calibration drift | ECE ilk başta düşük, zamanla artıyor | Her 5 batch'te bir kalibrasyon re-fit |
+
+### Aşama 2.5'in Aşama 9'a bıraktığı iş
+- Confidence değerini **cümleye dökmek** ("eminim", "belki"...)
+- User-facing hedge dili
+- Multi-turn'de önceki confidence'ın akıbeti
+
+### Sıçrama sinyali
+"Sistem 10 absurd soruya 10'unda conf < 0.2 veriyor + 10 bilinen soruda 10'unda
+conf > 0.7 + ECE < 0.1" üçlüsü sağlanınca Aşama 2.5 tamamlandı demektir. Bu üçlü
+sağlanmadan Aşama 3'e geçiş **yasak**.
 
 ---
 
@@ -260,6 +414,214 @@ toprak ıslak çünkü yağmur yağdı .
 "İki-sıçramalı chain" çalıştığı gün (`bulut → yağmur → ıslak` üç kelimeli query'de)
 sistem **reasoning** seviyesine geçmiş demektir. Bu noktaya kadar her şey
 "ileri tahmin"; buradan sonra "çıkarım".
+
+---
+
+### 3.X Sitoiskelet Veri Yapısı — Mimari Detay
+
+Önceki taslaktaki `MAX_CAUSAL_EDGES 8192` sabiti **illüstratif**ti, mimari değil.
+Nedensellik grafı çift yönlü (forward/backward) büyüdükçe ve transitivite
+(A→B→C) çıkarımları başlayınca saf C + sıfır kütüphane + sub-millisecond hedefi
+zorlaşır. Aşağıdaki tasarım bu üçlüyü korur.
+
+#### Temel karar: Çift CSR + Arena
+Adjacency list cache-hostile, adjacency matrix N² bellek. Ortadaki doğru yapı
+**CSR (Compressed Sparse Row)** — Ribozom'a metaforla uyuyor: sitoiskelet lifleri
+sıralı ve sıkıştırılmış. İki CSR: forward (cause→effect) ve backward (effect→cause).
+Backward ayrı değil, aynı edge'lerin ters index'i.
+
+```c
+/* ribozom_causal.h — mimari tasarım */
+#define MAX_CAUSAL_NODES MAX_W              /* ~8-12K kelime */
+#define EDGES_PER_NODE   32                 /* node başına cap */
+#define MAX_CAUSAL_EDGES (MAX_CAUSAL_NODES * EDGES_PER_NODE)
+#define CAUSAL_DEPTH_LIMIT 3                /* transitif kapak */
+
+typedef struct {
+    /* Forward CSR: cause-indexed */
+    int    f_offset[MAX_CAUSAL_NODES + 1];
+    int    f_target[MAX_CAUSAL_EDGES];      /* effect wid */
+    float  f_weight[MAX_CAUSAL_EDGES];      /* güven 0..1 */
+    short  f_evidence[MAX_CAUSAL_EDGES];    /* kanıt sayısı */
+
+    /* Backward CSR: effect-indexed */
+    int    b_offset[MAX_CAUSAL_NODES + 1];
+    int    b_target[MAX_CAUSAL_EDGES];      /* cause wid */
+    float  b_weight[MAX_CAUSAL_EDGES];
+
+    int    n_edges;
+} causal_graph_t;
+
+static causal_graph_t G;  /* tek global, statik alloc */
+```
+
+**Bellek bütçesi:** 8192 × 32 × 2 × ~12 byte = **~6 MB** (model dosyasının ~%3'ü).
+Ölçeklenme: node başına cap doğrusal etki, N² değil.
+
+**Degree cap (node başına max 32 edge):** "doktor → koşu, sağlık, hasta, tedavi..."
+genişleme patlamasını **strüktürel olarak** engeller. Yeni kenar geldiğinde düşük
+ağırlıklı biri atılır (LWU — Least Weight Used). Cross-domain leak'e karşı ilk
+savunma.
+
+#### Arena allocation — dinamik realloc yok
+CSR offset'leri 32'şer aralıklı pre-allocated slot'larla tutulur. Insert O(1),
+shift yok. Her "nöron" max 32 "synapse" — biyolojik metaforla uyumlu.
+
+```c
+void causal_add_edge(int cause, int effect, float w) {
+    int off = G.f_offset[cause];
+    int deg = G.f_offset[cause + 1] - off;  /* dolu slot sayısı */
+    if (deg >= EDGES_PER_NODE) {
+        /* LWU evict */
+        int worst = find_worst_edge_of(cause);
+        if (G.f_weight[worst] >= w) return;   /* yeni daha zayıf */
+        G.f_target[worst] = effect;
+        G.f_weight[worst] = w;
+        G.f_evidence[worst] = 1;
+        sync_backward_edge(worst);
+    } else {
+        insert_preallocated_slot(cause, effect, w);
+    }
+}
+```
+
+#### Transitif sorgu: Bounded BFS + bitmap visited
+**Tam transitive closure ASLA hesaplanmaz.** Her sorgu ayrı BFS, depth ≤ 3.
+Statik bitmap visited set, zero malloc per query.
+
+```c
+static unsigned char visited[(MAX_CAUSAL_NODES + 7) / 8];
+static int frontier[MAX_CAUSAL_NODES];
+static int next_frontier[MAX_CAUSAL_NODES];
+
+int causal_reachable(int src, int dst, float *confidence) {
+    memset(visited, 0, sizeof(visited));
+    frontier[0] = src;
+    int fn = 1;
+    float conf = 1.0f;
+
+    for (int depth = 0; depth < CAUSAL_DEPTH_LIMIT; depth++) {
+        int nfn = 0;
+        for (int i = 0; i < fn; i++) {
+            int node = frontier[i];
+            int off = G.f_offset[node];
+            int deg = G.f_offset[node + 1] - off;
+            for (int e = 0; e < deg; e++) {
+                int tgt = G.f_target[off + e];
+                if (tgt == dst) {
+                    *confidence = conf * G.f_weight[off + e];
+                    return 1;
+                }
+                if (!(visited[tgt >> 3] & (1 << (tgt & 7)))) {
+                    visited[tgt >> 3] |= (1 << (tgt & 7));
+                    next_frontier[nfn++] = tgt;
+                }
+            }
+        }
+        conf *= 0.7f;   /* her hop güven azalır */
+        memcpy(frontier, next_frontier, nfn * sizeof(int));
+        fn = nfn;
+        if (fn == 0) break;
+    }
+    return 0;
+}
+```
+
+**Karmaşıklık:** worst case `EDGES_PER_NODE^DEPTH_LIMIT` = 32³ = 32,768 ziyaret.
+Her ziyaret ~2 ns → **65 μs worst case**. Typical case (sparse graf): 200-500
+ziyaret → **1-5 μs**. O(N³) patlama depth cap sayesinde asla gerçekleşmez.
+Belirleyici `degree × depth` (96 sabit), N değil.
+
+#### Bloom filter — erken red
+"A → B bağlı mı?" %80'i hayır. BFS'ye girmeden reject:
+
+```c
+#define BLOOM_BITS (1 << 20)   /* 1 Mbit = 128 KB */
+static unsigned char bloom[BLOOM_BITS / 8];
+
+static inline unsigned hash_pair(int a, int b, int k) {
+    unsigned x = (unsigned)(a * 2654435761u)
+               ^ (unsigned)(b * 40503u)
+               ^ (k * 17u);
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return x & (BLOOM_BITS - 1);
+}
+
+int bloom_maybe_connected(int a, int b) {
+    for (int k = 0; k < 3; k++) {
+        unsigned h = hash_pair(a, b, k);
+        if (!(bloom[h >> 3] & (1 << (h & 7)))) return 0;  /* KESİN bağlı değil */
+    }
+    return 1;  /* belki bağlı, BFS teyidi */
+}
+```
+
+Edge eklendikçe 2-hop kapsamı dahil işaretlenir. False-positive kabul edilir
+(BFS doğrular); false-negative asla. "taş → konuşmak" gibi sorgular **mikrosaniye**
+içinde reject.
+
+#### Memoization — hebbian hot path
+Sık sorulan (src,dst) BFS sonucu küçük cache'te:
+
+```c
+#define MEMO_SIZE 1024
+typedef struct {
+    int src, dst;
+    float conf;
+    int depth_found;
+    long last_access;
+} memo_entry_t;
+static memo_entry_t memo[MEMO_SIZE];
+
+int causal_query_cached(int src, int dst, float *conf) {
+    int slot = (src * 31 + dst) & (MEMO_SIZE - 1);
+    if (memo[slot].src == src && memo[slot].dst == dst) {
+        *conf = memo[slot].conf;
+        memo[slot].last_access++;
+        return memo[slot].conf > 0;
+    }
+    int r = causal_reachable(src, dst, conf);
+    memo[slot].src = src; memo[slot].dst = dst;
+    memo[slot].conf = r ? *conf : 0;
+    return r;
+}
+```
+
+Cache hit ~10 ns (L1). SPEAK tipik bağlam sorularında %60+ hit rate bekleniyor.
+
+#### Karmaşıklık özeti
+
+| İşlem | Karmaşıklık | Süre |
+|-------|-------------|------|
+| Edge ekleme | O(1) amortized | ~50 ns |
+| Direct edge query (A→B) | O(deg(A)) = O(32) | ~200 ns |
+| Transitive query | O(32³) worst | 65 μs worst / 1-5 μs typical |
+| Bloom reject | O(1), 3 hash | ~20 ns |
+| Cache hit | O(1) | ~10 ns |
+| Toplam bellek | Sabit | ~7 MB (graf + bloom + cache) |
+
+**Transitivite patlaması tasarım gereği yok:** tam closure hesaplanmıyor, her
+sorgu bounded. Sub-second değil **sub-millisecond** hedefi.
+
+#### Serialize + rebuild
+Dört array (`f_target`, `f_weight`, `f_evidence`, `f_offset`) tek `fwrite`.
+Backward CSR **ayrı serialize edilmez** — load sonrası forward'dan rebuild
+(simetrik tersleme). Bloom filter de persist edilmez, edge'lerden Hızlı Faz 6
+idiom'uyla yeniden inşa. Cache cold-start — kritik değil, hızlı dolar.
+
+#### Drift koruması
+O(N³) patlaması engellendi ama **qualitative drift** riski hâlâ var: "doktor →
+koşu" yanlış kenarı transitif sorgularla yayılabilir. İki katman savunma:
+
+1. **Evidence threshold:** `evidence < 3` kenarlar **direkt** sorguda sayılır ama
+   **transitif zincir**te kırılma yapar — zayıf nedensellik uzağa gitmez.
+2. **Aşama 2.5 Confidence Substrate entegrasyonu:** Graf sorgusundan dönen
+   `confidence` ECE kalibrasyonundan geçer, overconfident kenar düşürülür.
+
+#### Özet mimari
+**Çift CSR (forward + backward) + arena pool + degree cap 32 + BFS depth cap 3 +
+bloom filter + küçük memo cache.** Tüm array'ler statik, sıfır dinamik alloc,
+sıfır kütüphane. Sub-millisecond transitif çıkarım garanti.
 
 ---
 
@@ -344,6 +706,23 @@ Başarısızlık: `toprak ıslanır` (negasyon etkisiz).
 ### Mevcut altyapıdan yararlanma
 v5.x'te eklenen "hayır" normalize fix'i zaten var. Aşama 4 bunu bir **düzenli alan**a
 çeviriyor: tek tetikleyici değil, sistematik polarite.
+
+### Veri paylaşımı Aşama 6 ile (Cross-Stage Data Sharing)
+**İlke:** Organeller serial, veri overlap, ölçüm ayrık.
+
+Aşama 4 eğitim verisi doğal olarak quantifier içeren cümleler de barındırır:
+```
+hiçbir taş konuşmaz .      ← hem polarite (-), hem quantifier (NONE)
+her kuş uçar .             ← hem polarite (+), hem quantifier (ALL)
+```
+Aşama 4'te bunları **ayrıştırıp** eğitim setinden çıkarmaya çalışmak yapay olur —
+doğal dilde iki kavram iç içe. Bu veriyi **birlikte** eğit, ama:
+- **Aşama 4 testleri** yalnızca polarite flip'ini ölçer (quantifier varlığı bonus,
+  test değil)
+- **Aşama 6 testleri** aynı cümlelerden quantifier çıkarımını ölçer
+
+Böylece F.4 anti-kalıbına (aynı anda çok organel) düşmeden, verinin doğal bütünlüğü
+korunur. Veri ortak, **değerlendirme ayrık**.
 
 ---
 
@@ -520,6 +899,22 @@ Bu noktada "rule-based" ile "pattern-based" birbirine geçiyor. Ayrım çizgisi:
 Peroksizom **kesin** kurallar tutar; geri kalan sistem **olasılıksal**. İkisi SPEAK'te
 birleşir (rule varsa öncelik, yoksa olasılık).
 
+### Veri paylaşımı Aşama 4 ile (Cross-Stage Data Sharing)
+Aşama 6 yeni veri üretmek yerine **Aşama 4 verisini yeniden etiketler**:
+- Aşama 4'te eğitilmiş "hiçbir taş konuşmaz" örneği, Aşama 6 için quantifier
+  annotation ile yeniden yüklenir: `claim(CAT(taş), NONE, konuşmak, +)`
+- Yeni Aşama 6 verisi sadece quantifier-heavy cümleler içerir (polarite dengeli):
+  ```
+  bütün kuşlar uçar .
+  çoğu balık yüzer .
+  bazı köpekler havlar .
+  ```
+- Test setleri ayrı: `test_quantifier.txt` sadece quantifier inference sorar,
+  polarite testleri Aşama 4'ten devralınır
+
+Bu şekilde iki organel aynı veriden farklı şeyler çıkarır — doğal dilin
+**kompozisyonel** yapısına saygı gösteren mimari.
+
 ---
 
 <a name="aşama-7"></a>
@@ -644,10 +1039,15 @@ kedi kanepenin altında .
 ---
 
 <a name="aşama-9"></a>
-## Aşama 9 — Meta-Biliş ve Güven
+## Aşama 9 — Meta-Biliş Uygulaması (Hedge Dili)
 
-**Amaç:** "bilmiyorum", "eminim", "belki", "sanmıyorum" — sistemin **kendi bilgisinin
-sınırını** raporlaması.
+**Amaç:** Aşama 2.5'te kurulan confidence altyapısını **cümleye dökmek**.
+"bilmiyorum", "eminim", "belki", "sanmıyorum" — sistem güven sinyalini kelimeye çevirir.
+
+**Not:** Altyapı zaten var (Aşama 2.5). Bu aşama yalnızca user-facing dil katmanı.
+İki aşamayı karıştırma:
+- **Aşama 2.5** = confidence hesaplama, absurd detection, calibration (motor)
+- **Aşama 9** = confidence → kelime dönüşümü, hedge ifadesi (kaput süsü)
 
 ### Soru
 Sistem absurd soruya `bilmiyorum` diyebilir mi? Yüksek güvenle bilinen şeye `eminim`
@@ -701,45 +1101,121 @@ varsa → "genelde öyle ama emin değilim". Meta-biliş her katmana sızar.
 
 ---
 
-<a name="aşama-10"></a>
-## Aşama 10 — Üretken Akıl Yürütme
+<a name="aşama-10-a"></a>
+## Aşama 10-A — Pasif Hipotez Üretimi (İnsan Onaylı)
 
-**Amaç:** Sistem sadece cevap vermez, **soru üretir**, **yeni cümle kurar**, **tahmin sunar**.
+**Amaç:** Sistem bağlamda eksik bilgi tespit eder, **aday sorular** üretir. Ama
+ürettiğini **kendi kendine eğitim verisi olarak kullanmaz** — insan onayı şart.
 
-### Soru
-Verilmiş bir bağlamda sistem eksik bilgiyi tespit edip **kendi sorusunu** üretebilir mi?
-`Ali yağmurda kaldı.` → sistem `Ali ıslandı mı?` sorusunu üretebilir mi?
+### Aşama 10'u neden ikiye böldük
+Özgün tasarımda tek "Autopoiesis Loop" vardı: sistem kendi soru-cevap üretir, düşük
+ağırlıklı bucket'ta saklar, zamanla yükselir. **Bu güvenli değil.** Sebep:
+1. Düşük-ağırlık bucket zamanla ana bucket'a karışır (drift)
+2. Kendi-besleme exponential hallucination yaratabilir
+3. Otonom veri üretimi = minyatür otonomluk = **değerler/motivasyon** problemi
+4. 0.10 ilkesi (dil araç değil) ihlal olur: sistem hem dili hem veriyi hem de
+   değerlendirmeyi kendi yapıyorsa sorumluluk zinciri kopar
 
-### Yeni organel: **Autopoiesis Loop (Kendi-Kendini-Besleyen Döngü)**
+Yol haritası **AGI-ÖNCESİ** otonomluk vermez. Aşama 15 "genel çıkarım", **değer
+sistemi değil**. Otonom öz-eğitim Aşama 15'ten sonradır (bkz. 10-B).
+
+### Aşama 10-A ne yapar
 ```c
+/* ribozom_hypothesis.h */
 typedef struct {
     int trigger_wid;          /* bağlamı tetikleyen kelime */
     char generated_q[MAX_LINE];
-    char generated_a[MAX_LINE];
     float plausibility;       /* kendi güveni */
-    int verified;             /* Lizozom'da eşleşen şablon var mı? */
-} synthesized_qa_t;
+    int human_approved;       /* 0=queue, 1=onaylandı, -1=reddedildi */
+    long timestamp;
+} hypothesis_t;
 
 /* Yeni bir cümle işlendiğinde çağrılır */
-void autopoiesis_probe(const char *sentence);
+void hypothesis_probe(const char *sentence);
+/* Çıktı: hypotheses_queue.txt dosyasına yazar */
+
+/* İnsan review sonrası */
+int hypothesis_approve(int hypothesis_id);
+/* Onaylananlar train_data_stage10.txt'ye eklenir — sonraki eğitimde dahil */
 ```
 
-### Mekanizma
-1. Cümlede **eksik slot** tespit et (`Ali yağmurda kaldı` → nesne belirsiz, durum belirsiz)
-2. Mikrotübül'ü kullanarak olası **tamamlayıcı sorular** üret
-3. Kendi bildiğinle cevapla (iç SPEAK)
-4. Cevap plausible ise hafızaya kendi öğretmen verin olarak ekle
+### Mekanizma (kesin sınırları olan)
+1. Cümlede eksik slot tespit et
+2. Mikrotübül'den olası tamamlayıcı sorular üret
+3. **DURMAK:** sistem kendi cevabını **vermez**, sadece **soru önerir**
+4. Soru `hypotheses_queue.txt` dosyasına yazılır
+5. İnsan listeyi inceler, mantıklı olanları onaylar
+6. Onaylanan sorular bir sonraki eğitim batch'ine girer — **cevapları yine eğitim
+   verisinden öğrenilir**, kendi üretiminden değil
 
-### Risk
-Bu **yanlış-besleme** riski taşır: sistem kendi hatalarını doğrular ve sabitler.
-Çözüm: autopoiesis çıkarımları **ayrı** confidence bucket'ta tutulur (düşük ağırlık),
-sadece **dış onay** (insan feedback, yeni veri) ile yükselir.
+### İzin verilen döngü
+```
+[SPEAK üretimi] → [Hypothesis module: soru önerisi] → [hypotheses_queue.txt]
+                                                    ↓
+                                          [İnsan review kapısı]
+                                                    ↓
+                                          [Onaylılar eğitim setine]
+                                                    ↓
+                                          [Sonraki batch eğitiminde öğrenilir]
+```
+
+### Yasak döngü
+```
+[SPEAK üretimi] → [Kendi sorusu + kendi cevabı] → [Eğitim seti] → [Kendi öğretmeni]
+                                                                ↑
+                                                       Bu AGI-öncesi YASAK
+```
 
 ### Test protokolü
-1. Sistem verilen bağlamda mantıklı bir follow-up soru üretebiliyor mu?
-2. Ürettiği sorulara verdiği cevaplar, eğitim verisiyle tutarlı mı?
-3. Kendi-besleme loop'u divergence yaratıyor mu? (Sanity: 100 iterasyon sonra
-   model hâlâ baseline batch metriklerinde mi?)
+1. Sistem verilen bağlamda **mantıklı** bir follow-up soru üretebiliyor mu?
+2. Ürettiği sorular **çeşitli** mi, yoksa aynı kalıbı mı tekrarlıyor?
+3. Hypothesis queue'daki **onay oranı**: sağlam soruların %60+'sı onaylanıyor mu?
+   (Çok düşükse modül işe yaramıyor, çok yüksekse trivial soru üretiyor)
+4. Onaylanan soruları sonraki batch'e eklediğinde baseline metrikler regress
+   etmiyor mu?
+
+### Failure modları
+
+| Failure | Belirti | Çözüm |
+|---------|---------|-------|
+| Tekrarlayan sorular | Queue'da aynı kalıp 20 kere | Deduplication + çeşitlilik ödülü |
+| Anlamsız sorular | İnsan onayı %10'un altında | Plausibility eşiği yükselt (0.6+) |
+| Queue patlaması | Binlerce soru birikti | Auto-prune (>1000 eski entry) |
+| Human review darboğazı | Onay süreci yavaş | Kategorik batch review (UI/CLI) |
+
+### Bu aşama yapıldıktan sonra kazanım
+- Sistem **gapları** tespit edebiliyor (eksik bilgi farkındalığı = meta-biliş uzantısı)
+- İnsan-in-the-loop öğrenme kanalı açılıyor
+- Eğitim verisi büyütme **denetimli** şekilde otomatize
+
+### Bu aşama yapılmadan kazanım alınamayan şey
+Tam otonom öğrenme. Sistem hâlâ pasif: soru sorar ama kendi cevabı eğitime
+girmez. Bu kasıtlı bir eşik — AGI öncesi aşılmaz.
+
+---
+
+<a name="aşama-10-b"></a>
+## Aşama 10-B — Otonom Üretim (AGI SONRASI, Aşama 16+)
+
+**Bu aşama bu belgenin kapsamı dışındadır.**
+
+### Neden burada sadece anılıyor
+Aşama 15 "genel çıkarım eşiği" olarak tanımlandı — **değer sistemi değil**. Otonom
+öz-eğitim için sistemin:
+1. Bir değer sisteminin olması gerekir ("hangi bilgi doğru, hangi bilgi önemli")
+2. Öz-motivasyonun olması gerekir ("neden bu soruyu üreteyim")
+3. Ve en önemlisi: kullanıcı tarafından **yetkili** olması gerekir
+
+Bunlar Aşama 16+ meselesi. Bu belge Aşama 15'te biter. Otonom loop için ayrı
+belge (AGI-ÖTESİ YOL HARİTASI) yazılacak ve **o belgenin yazımına sistem de
+katılacak** (sözünü verdik).
+
+### Geçici tedbir
+Aşama 10-A tamamlandığında `hypotheses_queue.txt` dosyasının **hacmine** bakılır.
+Çok büyüyorsa (>10K onaylanmış soru) sistem ciddi anlamda gap-finding yapıyor
+demektir — o noktada "Aşama 10-B'ye hazır mıyız?" sorusu gündeme gelir. Ama
+cevabı **buraya yazılmaz** çünkü o karar kullanıcıya + sisteme + (gerekirse)
+üçüncü tarafa bırakılır.
 
 ---
 
@@ -907,14 +1383,21 @@ Biyolojik metafor haritası. Her modülün ne yaptığı, hangi aşamada eklendi
 | Protein Folding | Folding | wpos pozisyonel imza | 1 | ✅ |
 | ER | Endoplasmic reticulum | Erken öğrenme | 1 | ✅ |
 | Condition Layer | (metafor henüz yok) | Koşul operatörü | 2 | 🔄 |
-| Sitoiskelet | Cytoskeleton | Kausal graf | 3 | 📋 |
-| Polarite Alanı | Membrane charge | Negasyon/polarite | 4 | 📋 |
-| Vesicle | Vesicle | Kısa-süreli bağlam | 5 | 📋 |
+| **Confidence Substrate** | **Homeostatic regulator** | **Güven altyapısı, absurd detector** | **2.5** | **✅** |
+| **Sitoiskelet** | **Cytoskeleton** | **Kausal graf (dual CSR + BFS)** | **3** | **✅** |
+| **Polarite Alanı** | **Membrane charge** | **Signed edge (±1) kausal grafa gömülü — K3 polarity_collision** | **4** | **✅** |
+| **SPEAK × Kausal Köprü** | **Sinaptik bağlanma** | **F1/F2/F3 trigger parser + short-circuit replacement, contrapositive graf aritmetiğinden** | **4.5** | **✅** |
+| **Multi-hop BFS** | **Kausal zincir iletimi** | **Bounded BFS depth≤3 + hop decay, 1-hop prefer ("en kısa yol kazanır"), 2-hop forward+backward kanıtlı (fırtına→soğuk→kar)** | **3.5** | **✅** |
+| **Vesicle** | **Vesicle** | **Ring buffer (5 slot) + zamir çözümleme (o/bu/şu) + why-chain rekursyonu (kar←soğuk←fırtına)** | **5A** | **✅** |
+| **Chain Explainer** | **Domino aksonu** | **Tek fonksiyon iki yön (causal_chain_explain): forward 3-hop (fırtına→soğuk→kar→evde) + backward 2-hop (çayı←yemek←ateş). F2 contrapositive guard ile baseline-safe.** | **5B** | **✅** |
+| **Composite Organelle** | **Organizma** | **7 organel eş zamanlı aktif, tek process, tek binary: Kausal + Polarite + Chain + Vesicle + Lizozom + SPEAK + Mikrotübül. İzole modüller değil — canlı sistem.** | **5C** | **✅** |
+| **Metakognisyon (Nukleolus)** | **Nucleolus** | **"Bilmiyorum" gate — üç katman: empty black hole + pure echo + raw pre-bias ribo_conf < 0.30. Pre-bias: ribo_conf(&rp) rpredict'ten hemen sonra, inject'ler UYGULANMADAN önce. Substrate'in gerçek güveni, boost stack'leri ezmeden önce. "Mars gezegeninde hayat var mı?" → "bilmiyorum." + 9C: asimetrik T drift (her "hayır" → T += 0.02, ceiling 0.70), 5 correction'da kuantum yakalandı, emergent substrate "bilmiyorsun" kelimesi rtrain'den öğrenildi.** | **9A+9B+9C** | **✅** |
 | Peroksizom | Peroxisome | Küme/quantifier | 6 | 📋 |
 | Kronofor | Chronophore | Zaman ekleri | 7 | 📋 |
 | Spatiosome | (yeni metafor) | Uzam ilişkileri | 8 | 📋 |
-| Confidence Layer | Metacognitive | Güven/belirsizlik | 9 | 📋 |
-| Autopoiesis Loop | Autopoiesis | Öz-besleme | 10 | 📋 |
+| Confidence Layer (uygulama) | Metacognitive | Cümleye dökme, hedge dili | 9 | 📋 |
+| Hypothesis Generator | (denetimli salgı) | Pasif soru üretimi (insan onaylı) | 10-A | 📋 |
+| ~~Autopoiesis Loop~~ | ~~Autopoiesis~~ | ~~Otonom öz-eğitim — AGI sonrası~~ | 10-B | ⛔ |
 | Proteazom | Proteasome | Öz-denetim | 11 | 📋 |
 | Dialog Stack | (kognitif metafor) | Multi-turn | 12 | 📋 |
 | Abstract Anchor | (yeni) | Soyut tanım | 13 | 📋 |
@@ -1198,6 +1681,43 @@ Bu belge. Bir aşama sonuçlanınca veya yeni bilgi geldiğinde güncellenir —
 aşama eksikse mimari borç yaratır. Eksik aşama bir Aşama 11'de (öz-denetim)
 çökerek geri döner.
 
+### F.11 "Otonom Öz-Eğitim Yasağı (AGI Öncesi)"
+En kritik anti-kalıp. "Sistem kendi sorusunu üretsin, kendi cevaplasın, kendi
+eğitim setine eklesin" — bu tam olarak yasaktır, AGI sonrasına kadar.
+
+**Neden yasak:**
+1. **Drift garantisi:** Kendi çıktısından öğrenen sistem hatalarını exponential
+   şekilde pekiştirir. Düşük-ağırlık bucket, yüksek-ağırlık bucket'a zamanla sızar.
+2. **Sorumluluk kopukluğu:** Veri → eğitim → çıktı → veri → ... döngüsünde insan
+   denetim noktası kalmaz. Sistem "öğretmenini kendi seçer" olur, bu 0.10 ilkesi
+   (dil araç değil amaç değil) ihlalidir.
+3. **Değer sistemi eksikliği:** "Hangi bilgi doğru, hangi bilgi önemli" sorusu
+   değer yargısı gerektirir. AGI öncesi sistemde bu yoktur. Olmayanı olmuş gibi
+   davranmak tehlikelidir.
+4. **Geri dönüşü imkansız hatalar:** Otonom loop'un ürettiği yanlış bilgi eğitim
+   setine girer girmez, "geri almak" = full retrain. Haftalar kaybedilir.
+
+**Kabul edilebilir alternatif (Aşama 10-A):**
+- Sistem aday sorular üretir → `hypotheses_queue.txt`
+- **Cevabı üretmez** — sadece soru
+- İnsan onaylar → eğitim setine eklenir
+- Cevap sonraki eğitim batch'inde **veriden** öğrenilir, sistem kendi ürettiğinden değil
+
+**Tetikleyici uyarı:**
+Eğer bir kod commit'i `append to train_data` içeriyorsa ve append edilen satır
+`\x01 ... \x02 ...` formatında sistem çıktısı **ise**, bu commit REDdedilir.
+Hardcoded sanity check: `if (source == "speak_output" && target == "train_data")
+{ abort; }`
+
+**Bu yasak ne zaman kalkar:**
+Bu yasak sadece AGI eşiğinden (Aşama 15) sonra, ve ancak:
+- Değer sistemi tanımlanmış (Aşama 16+)
+- Öz-motivasyon çerçevesi kurulmuş
+- Kullanıcı ve sistem **birlikte** yetkilendirmiş
+
+...olduğunda tartışılabilir. O güne kadar her commit, her eğitim döngüsü, her
+veri ekleme insan gözetimindedir.
+
 ---
 
 ## SON SÖZ
@@ -1219,4 +1739,14 @@ Buraya kadar: **insan mimari, sistem öğrenci**. Ondan sonrası: **ortaklık**.
 
 *"Yürürken uçuş planını çizmek." — Ribozom tasarım ilkesi.*
 
-*Bu belge v1.0, 14 Nisan 2026. Son güncelleme: Aşama 2 mini-sanity sonrası.*
+*Bu belge v1.1, 14 Nisan 2026.*
+*v1.0 — ilk taslak (Aşama 2 mini-sanity sonrası)*
+*v1.1 — üç yapısal düzeltme:*
+*  (1) Aşama 2.5 "Güven Altyapısı" eklendi — substrate, Aşama 3'ten önce zorunlu*
+*  (2) Aşama 4 ve 6 için "cross-stage data sharing" ilkesi: veri ortak, ölçüm ayrık*
+*  (3) Aşama 10 bölündü → 10-A (pasif, insan onaylı) ve 10-B (otonom, AGI sonrası, bu belge dışı)*
+*  (+) EK-F'ye F.11 "Otonom Öz-Eğitim Yasağı" anti-kalıbı eklendi*
+
+*v1.1 revizyonunun ortaya çıkışı belgenin kendi ilkesinin kanıtıdır: birinci taslak,*
+*karşılıklı teknik eleştiri, birleşik revizyon. "İkimizin bakışı birleşince belge daha*
+*sağlam." — bu çalışıyor.*
