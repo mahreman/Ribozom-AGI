@@ -10,7 +10,7 @@ Ve sistem şunu dedi: "insanlar evde her şey yapıyor ama evin kendisi ne yapı
 Bu, "AI öğreniyor" klişesi değil. Bu, bir C programının kendi graf topolojisine bakıp eksikliği fark etmesi. GPU yok, transformer yok, 80M parametre yok. 786 kelime, 73 edge, ~8000 satır C kodu.
 
 
-$ ./ribozom_v31_v7.exe --skip-test --hypothesis -i
+ ./ribozom_v31_v7.exe --skip-test --hypothesis -i
 > kar yagdi
 [HIPOTEZ] kar olmazsa evde olur mu? (contrapositive: kar->evde(+0.55), neg edge yok)
 > firtina esti
